@@ -235,6 +235,13 @@ func (a *App) configKey(act Action, k term.Key) bool {
 		}
 	}
 	wide := a.vp.Width >= 88
+	if wide && k.Type == term.KeyTab {
+		delta := 1
+		if k.Mod&term.ModShift != 0 {
+			delta = -1
+		}
+		return a.configCategoryMove(delta, s)
+	}
 	switch act {
 	case ActionCancel, ActionInterrupt:
 		if v.detail && !wide {
@@ -298,6 +305,20 @@ func (a *App) configKey(act Action, k term.Key) bool {
 		return a.configMove(max(1, a.cfg.WheelLines), s, wide)
 	}
 	return false
+}
+
+func (a *App) configCategoryMove(n int, s ConfigSnapshot) bool {
+	v := a.configView
+	if len(s.Categories) == 0 {
+		return false
+	}
+	to := min(max(0, v.category+n), len(s.Categories)-1)
+	if to == v.category {
+		return false
+	}
+	v.category = to
+	v.row = 0
+	return true
 }
 
 func (a *App) configMove(n int, s ConfigSnapshot, wide bool) bool {
@@ -476,10 +497,17 @@ func renderConfig(s ConfigSnapshot, v *configViewState, vp ui.Viewport) ui.Frame
 		if i < len(v.rowEnds) {
 			selectedEnd = v.rowEnds[i]
 		}
+	} else if vp.Width < 88 && !v.detail && len(s.Categories) > 0 {
+		selectedTop = v.category
+		selectedEnd = v.category + 1
+		if v.errorText != "" {
+			selectedTop += 2
+			selectedEnd += 2
+		}
 	}
 	maxTop := max(0, len(body)-rows)
 	top := min(max(0, selectedTop), maxTop)
-	if selectedEnd-top > rows {
+	if selectedEnd-selectedTop <= rows && selectedEnd-top > rows {
 		top = min(maxTop, max(0, selectedEnd-rows))
 	}
 	visible := min(rows, max(0, len(body)-top))
@@ -518,6 +546,9 @@ func configHeader(s ConfigSnapshot, v *configViewState, width int) ui.Line {
 
 func configFooter(s ConfigSnapshot, v *configViewState, width, above, below int) ui.Line {
 	text := "Esc back  ·  Enter open/edit  ·  ←/→ adjust"
+	if width >= 88 {
+		text = "Esc back  ·  Tab category  ·  Enter edit  ·  ←/→ adjust"
+	}
 	if s.SaveEnabled {
 		text += "  ·  s save"
 	}

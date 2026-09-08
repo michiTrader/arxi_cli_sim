@@ -35,6 +35,8 @@ and an interface you can choose.
 | —  | the two bottom rows off the edge of the terminal  | **done**: `bottomMargin = 1`, spent before the text is fitted |
 | —  | a light sweeping the input bar while you idle     | **done**, and the verb too: `ui.Shimmer`, `-shine=false` stops it |
 | B2 | multi-agent status and a team roster sheet        | **done**: live member glyphs, Ctrl+T, and `/team` |
+| —  | app-owned Tasks monitor                          | **done**: `/tasks`, responsive full-frame task state |
+| —  | app-owned Config editor                          | **done**: `/config`, live previews, provenance, and persistence |
 | 6  | a draggable scrollbar pill, accelerating wheel     | **done**: the pill drags and the notch ramps, both under `-mouse` |
 | 5  | ctrl+wheel to resize the terminal                 | **not ours**: the emulator owns that gesture |
 | 7  | a selection that survives a scroll                | **not fixable** inside the alternate screen; accepted |
@@ -716,9 +718,36 @@ thumb stays under your finger through the two places a reader aims hardest, the 
 tail, where the row each end was holding back is released and the track the pointer is crossing stops
 being the track the thumb will be redrawn in.
 
-Every item above is covered by mutation tests, and `python3 tools/mut.py` currently reports
-**284 of 284 mutations caught** across `internal/ui`, `internal/app`, `internal/config`,
-`internal/term`, `internal/event`, `internal/state` and `internal/scenario`.
+Every item above is covered by mutation tests. The harness now includes the command package as well
+as `internal/ui`, `internal/app`, `internal/config`, `internal/term`, `internal/event`,
+`internal/state` and `internal/scenario`; run `python3 tools/mut.py` for the current total.
+
+**Task 5 — Config is an app-owned full frame.** `/config` opens the canonical surface and the
+hidden `/settings` alias reaches the same one. Wide terminals keep a category master beside the
+selected detail and use Tab/Shift+Tab between categories; narrower terminals stage the category
+list and detail. Both tiers preserve the selected category or setting through short heights, down
+to an honest one-row status. The Config scalar editor reuses editing operations but none of the
+conversation prompt's border, marker, placeholder, wrapping, or history, and only it exposes the
+cursor. Enter, paste, and printable input cannot leak into the conversation draft; closing restores
+that draft and its scroll position unchanged.
+
+The controller remains in `internal/config`, behind DTOs and the narrow interface in `internal/app`,
+so app never imports config. It keeps persisted baseline, editable draft, runtime-effective value,
+and source as separate facts. Explicit title, scroll, mouse, and shine flags mask live preview while
+the underlying draft remains saveable. Title, scroll distance, shine, period, travel, and width
+preview immediately when unmasked; mouse is labelled and treated as next-launch only. Effort and
+Recap are session state and never enter the document. Keys, Glyphs, and Styles are read-only
+inspectors that show default, configured, and effective layers.
+
+Save writes all seven persistent scalar settings through the lossless `config.Document`, retains
+validation and conflict errors in the frame, and advances the Cancel baseline only after success.
+Reload refuses a dirty draft until the reader explicitly confirms discard. An explicit
+`-config ""` constructs a disabled controller: Save and Reload stay unavailable and no default file
+is created. Focused app, controller, and command tests cover responsive geometry, aliases, input
+isolation, preview masks, all animation fields, next-launch mouse behavior, invalid edits, baseline
+advancement, conflict retention, CLI provenance, the default path, and disabled persistence. The
+focused `config controller:`, `config command:`, and `config view:` mutation families hold those
+seams, and `--anchors` also checks the older families after the full-view refactor.
 
 **B2 — a run with a team reads as a team.** arxi has a real `MemberConfig`; placing its
 member data in `run.started.members` is an additive simulator replay extension, not the current
@@ -765,11 +794,12 @@ automated gate; desktop and Termux playback remain the required human oracle for
 
 ## Next
 
-The interaction design is implemented. Before this redesign can be called closed, its focused
-mutation families and the complete Go/mutation checks must pass, then scenario 11 must be played
-on a real desktop terminal and Termux. Those terminal checks cover Team entry and exact return,
-independent scrolling and live updates, resize transitions down to one row and below 32 columns,
-the vertical effort selector below 24 columns, desktop drag/selection, and Termux swipes.
+The automated implementation gate for Team, Tasks, and Config is complete. The remaining oracle is
+manual terminal interaction: play scenario 11 on a desktop terminal and Termux to check Team entry
+and return, independent scrolling and live updates, resize transitions down to one row, the vertical
+effort selector below 24 columns, desktop drag/selection, and Termux swipes. Config additionally
+needs a hand check of wide Tab category movement, narrow staged navigation, local scalar editing,
+live preview and Cancel/Save/Reload feedback against a disposable config file.
 
 Demand 6's three pieces remain completed and are retained here as their design record:
 

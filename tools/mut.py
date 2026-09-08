@@ -22,7 +22,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # see it — app builds its keys from names, so a decoder that folds 0x0a back into enter passes
 # every test in the other three packages.
 PKGS = ["./internal/ui", "./internal/app", "./internal/config", "./internal/term",
-        "./internal/event", "./internal/state", "./internal/scenario"]
+        "./internal/event", "./internal/state", "./internal/scenario", "./cmd/arxi-sim"]
 # A mutant is expected to fail, and one way to fail is to never finish: unbind ctrl+d and the
 # test that presses keys until the app quits presses them forever. Go's own default is ten
 # minutes, which the sweep would then spend on one line, so the runs below carry a limit of
@@ -153,12 +153,27 @@ at("multiline: a pasted CR survives", "internal/app/app.go", r"""		case r == '\r
 			return '\n'""", r"""		case r == '\r':
 			return r""")
 
-at("multiline: a pasted tab survives", "internal/app/app.go", r"""		case r == '\t':
-			return ' '""", r"""		case r == '\t':
+at("multiline: a pasted tab survives", "internal/app/app.go", r"""func clean(s string) string {
+	return strings.Map(func(r rune) rune {
+		switch {
+		case r == '\n':
+			return r
+		case r == '\r':
+			return '\n'
+		case r == '\t':
+			return ' '""", r"""func clean(s string) string {
+	return strings.Map(func(r rune) rune {
+		switch {
+		case r == '\n':
+			return r
+		case r == '\r':
+			return '\n'
+		case r == '\t':
 			return r""")
 
 at("multiline: a delete byte reaches the line", "internal/app/app.go",
-    "case r < ' ' || r == 0x7f:", "case r < ' ':")
+    "func clean(s string) string {\n\treturn strings.Map(func(r rune) rune {\n\t\tswitch {\n\t\tcase r == '\\n':\n\t\t\treturn r\n\t\tcase r == '\\r':\n\t\t\treturn '\\n'\n\t\tcase r == '\\t':\n\t\t\treturn ' '\n\t\tcase r < ' ' || r == 0x7f:",
+    "func clean(s string) string {\n\treturn strings.Map(func(r rune) rune {\n\t\tswitch {\n\t\tcase r == '\\n':\n\t\t\treturn r\n\t\tcase r == '\\r':\n\t\t\treturn '\\n'\n\t\tcase r == '\\t':\n\t\t\treturn ' '\n\t\tcase r < ' ':")
 
 # The status row, which no recording draws and no golden file covers.
 
@@ -1393,7 +1408,7 @@ at("team roster: run.started discards members", "internal/state/state.go",
    "\t\t\ts.seedMembers(p.Members)\n", "")
 
 at("team roster: duplicate blueprint names survive", "internal/state/state.go",
-   'if spec.Name == "" || s.findMember(spec.Name) != nil {', 'if spec.Name == "" {')
+   'if spec.Name == "" || seen[spec.Name] {', 'if spec.Name == "" {')
 
 at("team roster: unknown actors are not appended", "internal/state/state.go",
    "\ts.Members = append(s.Members, m)\n\treturn m", "\treturn m")
@@ -1515,24 +1530,31 @@ mut("info-zone: provenance drops its recorded branch", "widget.go",
 # team-view: this is complete-frame app state, not a floating overlay or snapshot.
 
 at("team-view: entry leaves the conversation in control", "internal/app/app.go",
-   "\ta.view = viewTeam\n", "\ta.view = viewConversation\n")
+   "func (a *App) openTeam() { a.openFullView(viewTeam) }",
+   "func (a *App) openTeam() { a.openFullView(viewConversation) }")
 
 at("team-view: draw uses a stale empty Team state", "internal/app/app.go",
-   "f := renderTeam(a.st, a.vp, a.teamTop)",
-   "f := renderTeam(state.New(), a.vp, a.teamTop)")
+   "f = renderTeam(a.st, a.vp, a.viewTop)",
+   "f = renderTeam(state.New(), a.vp, a.viewTop)")
 
 at("team-view: escape does not restore conversation", "internal/app/app.go",
-   "func (a *App) closeTeam() { a.view = viewConversation }",
-   "func (a *App) closeTeam() {}")
+   "func (a *App) closeFullView() { a.view = viewConversation }",
+   "func (a *App) closeFullView() {}")
 
 at("team-view: printable input reaches the editor", "internal/app/app.go",
    """func (a *App) dispatch(act Action, k term.Key) bool {
-	if a.view == viewTeam {
-		return a.teamKey(act)
+	if a.view == viewConfig {
+		return a.configKey(act, k)
+	}
+	if a.view != viewConversation {
+		return a.fullViewKey(act)
 	}""",
    """func (a *App) dispatch(act Action, k term.Key) bool {
-	if a.view == viewTeam && act != ActionNone {
-		return a.teamKey(act)
+	if a.view == viewConfig {
+		return a.configKey(act, k)
+	}
+	if a.view != viewConversation && act != ActionNone {
+		return a.fullViewKey(act)
 	}""")
 
 at("team-view: one-row surface draws no compact summary", "internal/app/team.go",
@@ -1568,13 +1590,8 @@ at("tasks monitor: escape does not restore conversation", "internal/app/app.go",
    'func (a *App) closeFullView() { a.view = viewConversation }',
    'func (a *App) closeFullView() {}')
 
-at("tasks monitor: printable input reaches editor", "internal/app/app.go", """func (a *App) dispatch(act Action, k term.Key) bool {
-\tif a.view != viewConversation {
-\t\treturn a.fullViewKey(act)
-\t}""", """func (a *App) dispatch(act Action, k term.Key) bool {
-\tif a.view != viewConversation && act != ActionNone {
-\t\treturn a.fullViewKey(act)
-\t}""")
+# Printable input isolation is shared by every app-owned full view and is held by the
+# team-view mutation above; a second Tasks anchor would not identify another seam.
 
 at("tasks monitor: completed status is shown as pending", "internal/app/tasks.go",
    'case event.TaskCompleted:\n\t\treturn "completed", g.Get("tasks.completed"), "tasks.completed"',
@@ -1602,6 +1619,59 @@ at("effort-vertical: selection window starts at the first level", "internal/app/
 at("effort-vertical: selected row loses its marker", "internal/app/overlay.go",
    'marker, markerStyle = "● ", "effort.marker"',
    'marker, markerStyle = "  ", "effort.marker"')
+
+# Task 5, the app-owned Config surface and its controller. These focused mutations hold the
+# provenance split, disabled persistence, live-preview boundary, navigation, short geometry,
+# local scalar editor, retained errors, and hidden alias rather than relying on broad snapshots.
+
+at("config controller: masked title draft becomes effective", "internal/config/controller.go",
+   "func effectiveString(draft, cli string, masked bool) string {\n\tif masked {\n\t\treturn cli\n\t}\n\treturn draft\n}",
+   "func effectiveString(draft, cli string, masked bool) string {\n\tif masked {\n\t\treturn draft\n\t}\n\treturn draft\n}")
+
+at("config controller: mouse claims live preview", "internal/config/controller.go",
+   'c.boolRow(app.ConfigMouse, "Mouse", c.draft.mouse, c.baseline.mouse, c.opts.Mouse, c.file.Mouse != nil, c.opts.MaskMouse, "next launch")',
+   'c.boolRow(app.ConfigMouse, "Mouse", c.draft.mouse, c.baseline.mouse, c.draft.mouse, c.file.Mouse != nil, c.opts.MaskMouse, "live")')
+
+at("config controller: dirty reload silently discards", "internal/config/controller.go",
+   "if c.dirty() && !discard {\n\t\treturn app.ErrConfigDirty\n\t}",
+   "if c.dirty() && discard {\n\t\treturn app.ErrConfigDirty\n\t}")
+
+at("config controller: successful save keeps old baseline", "internal/config/controller.go",
+   "\tc.baseline = c.draft\n\treturn nil", "\treturn nil")
+
+at("config controller: disabled reload reads disk", "internal/config/controller.go",
+   "if !c.opts.Enabled {\n\t\treturn errors.New(\"reload is disabled for this run\")\n\t}",
+   "if c.opts.Enabled {\n\t\treturn errors.New(\"reload is disabled for this run\")\n\t}")
+
+at("config command: explicit empty path stays enabled", "cmd/arxi-sim/main.go",
+   'configPath, configEnabled = o.config, o.config != ""',
+   "configPath, configEnabled = o.config, true")
+
+at("config command: title flag loses its mask", "cmd/arxi-sim/main.go",
+   'MaskTitle: given(fs, "title"), MaskScroll: given(fs, "scroll"),',
+   'MaskTitle: false, MaskScroll: given(fs, "scroll"),')
+
+at("config view: wide Tab cannot change category", "internal/app/config_view.go",
+   "if wide && k.Type == term.KeyTab {", "if false && wide && k.Type == term.KeyTab {")
+
+at("config view: narrow category selection never scrolls", "internal/app/config_view.go",
+   "} else if vp.Width < 88 && !v.detail && len(s.Categories) > 0 {",
+   "} else if false && vp.Width < 88 && !v.detail && len(s.Categories) > 0 {")
+
+at("config view: tall selected row hides its first line", "internal/app/config_view.go",
+   "if selectedEnd-selectedTop <= rows && selectedEnd-top > rows {",
+   "if selectedEnd-top > rows {")
+
+at("config view: masked values preview", "internal/app/config_view.go",
+   "if row.Masked || row.Kind == ConfigReadOnly {",
+   "if row.Kind == ConfigReadOnly {")
+
+at("config view: invalid edit closes its editor", "internal/app/config_view.go",
+   "v.errorText = err.Error()\n\t\t\treturn true",
+   "v.errorText = err.Error()\n\t\t\tv.editID = \"\"\n\t\t\treturn true")
+
+at("config view: settings alias disappears", "internal/app/app.go",
+   'case "config", "settings":', 'case "config":')
 
 # approval-vertical: each response remains an independently rendered row.
 

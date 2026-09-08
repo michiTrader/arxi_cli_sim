@@ -46,14 +46,20 @@ func newControllerAt(t *testing.T, body string, mutate func(*ControllerOptions))
 	if mutate != nil {
 		mutate(&o)
 	}
+	c, err := NewController(o)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return c, path
+}
 
 func TestControllerDraftEffectiveAndCLIMasking(t *testing.T) {
 	c, _ := newControllerAt(t, "", func(o *ControllerOptions) {
-		o.Title, o.ScrollLines, o.Shine = "CLI title", 9, false
+		o.Title, o.ScrollLines, o.Shine = "CLI title", 9, true
 		o.MaskTitle, o.MaskScroll, o.MaskShine = true, true, true
 	})
 	for id, value := range map[app.ConfigID]string{
-		app.ConfigInputTitle: "draft title", app.ConfigScrollLines: "6", app.ConfigShine: "true", app.ConfigPeriod: "33",
+		app.ConfigInputTitle: "draft title", app.ConfigScrollLines: "6", app.ConfigShine: "false", app.ConfigPeriod: "33",
 	} {
 		if err := c.Set(id, value); err != nil {
 			t.Fatal(err)
@@ -61,13 +67,13 @@ func TestControllerDraftEffectiveAndCLIMasking(t *testing.T) {
 	}
 	s := c.Snapshot()
 	checks := []struct {
-		id                                app.ConfigID
+		id                               app.ConfigID
 		value, persisted, effective, src string
 		masked                           bool
 	}{
 		{app.ConfigInputTitle, "draft title", "file title", "CLI title", "CLI", true},
 		{app.ConfigScrollLines, "6", "5", "9", "CLI", true},
-		{app.ConfigShine, "true", "true", "false", "CLI", true},
+		{app.ConfigShine, "false", "true", "true", "CLI", true},
 		{app.ConfigPeriod, "33", "21", "33", "file", false},
 	}
 	for _, want := range checks {
@@ -99,6 +105,86 @@ func TestControllerDefaultsAndValidation(t *testing.T) {
 	} {
 		if err := c.Set(id, value); err == nil {
 			t.Errorf("Set(%s, %q) succeeded", id, value)
+		}
+	}
+}
+
+func TestControllerReloadDirtyConflictAndDisabledMode(t *testing.T) {
+	c, path := newControllerAt(t, "[input]\ntitle = \"file title\"\n", nil)
+	if err := c.Set(app.ConfigInputTitle, "draft"); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Reload(false); !errors.Is(err, app.ErrConfigDirty) {
+		t.Fatalf("dirty Reload = %v, want ErrConfigDirty", err)
+	}
+	if err := os.WriteFile(path, []byte("[input]\ntitle = \"external\"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Save(); !errors.Is(err, ErrConflict) {
+		t.Fatalf("Save after external edit = %v, want ErrConflict", err)
+	}
+	if !c.Snapshot().Dirty {
+		t.Fatal("conflicted Save discarded the dirty draft")
+	}
+	if err := c.Reload(true); err != nil {
+		t.Fatal(err)
+	}
+	got := rowByID(t, c.Snapshot(), app.ConfigInputTitle)
+	if got.Value != "external" || got.Persisted != "external" || got.Effective != "external" || got.Dirty {
+		t.Fatalf("forced Reload = %+v", got)
+	}
+
+	disabledPath := filepath.Join(t.TempDir(), "must-not-exist.toml")
+	disabled, err := NewController(ControllerOptions{Path: disabledPath, Enabled: false, File: &File{}, Mouse: true, Shine: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if disabled.Snapshot().SaveEnabled || !strings.Contains(disabled.Snapshot().Categories[0].Rows[0].Value, "disabled") {
+		t.Fatalf("disabled snapshot = %+v", disabled.Snapshot())
+	}
+	if err := disabled.Set(app.ConfigInputTitle, "still editable"); err != nil {
+		t.Fatal(err)
+	}
+	if err := disabled.Save(); err == nil {
+		t.Fatal("disabled Save succeeded")
+	}
+	if err := disabled.Reload(true); err == nil {
+		t.Fatal("disabled Reload succeeded")
+	}
+	if _, err := os.Stat(disabledPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("disabled controller created %s: %v", disabledPath, err)
+	}
+}
+
+func TestControllerInspectorsExposeAllLayers(t *testing.T) {
+	f := controllerFile()
+	f.Keys["ctrl+x"] = app.ActionCancel
+	f.Glyphs["bullet"] = "* "
+	f.Styles["prompt.text"] = ui.Style{Attrs: ui.AttrBold}
+	c, err := NewController(ControllerOptions{File: f, Mouse: false, Shine: true, Anim: f.Anim})
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := c.Snapshot()
+	for _, category := range []string{"Overview", "Input", "Scrolling", "Animation", "Session", "Keys", "Glyphs", "Styles"} {
+		found := false
+		for _, got := range s.Categories {
+			if got.Name == category {
+				found = true
+				if (category == "Keys" || category == "Glyphs" || category == "Styles") && len(got.Rows) == 0 {
+					t.Errorf("%s inspector is empty", category)
+				}
+				for _, row := range got.Rows {
+					if category == "Keys" || category == "Glyphs" || category == "Styles" {
+						if row.Kind != app.ConfigReadOnly || !strings.Contains(row.Detail, "default ") || !strings.Contains(row.Detail, "configured ") || !strings.Contains(row.Detail, "effective ") {
+							t.Errorf("%s row lacks layers: %+v", category, row)
+						}
+					}
+				}
+			}
+		}
+		if !found {
+			t.Errorf("snapshot lacks %s category", category)
 		}
 	}
 }

@@ -322,22 +322,26 @@ func play(args []string) error {
 	if term.IsTermux() && !given(fs, "scroll") && o.scroll <= 0 {
 		o.scroll = 1
 	}
+	controller, err := configControllerFor(fs, o, f)
+	if err != nil {
+		return err
+	}
+	return live(tty, sc, em, &glyphs, km, controller, o)
+}
+
+func configControllerFor(fs *flag.FlagSet, o options, f *config.File) (*config.Controller, error) {
 	configPath := config.DefaultPath()
 	configEnabled := configPath != ""
 	if given(fs, "config") {
 		configPath, configEnabled = o.config, o.config != ""
 	}
-	controller, err := config.NewController(config.ControllerOptions{
+	return config.NewController(config.ControllerOptions{
 		Path: configPath, Enabled: configEnabled, File: f, ASCII: o.ascii,
 		Runtime: runtimeLabel(o), Title: o.title, ScrollLines: o.scroll, Mouse: o.mouse,
 		Shine: o.shine, Anim: o.anim,
 		MaskTitle: given(fs, "title"), MaskScroll: given(fs, "scroll"),
 		MaskMouse: given(fs, "mouse"), MaskShine: given(fs, "shine"),
 	})
-	if err != nil {
-		return err
-	}
-	return live(tty, sc, em, &glyphs, km, controller, o)
 }
 
 func runtimeLabel(o options) string {
