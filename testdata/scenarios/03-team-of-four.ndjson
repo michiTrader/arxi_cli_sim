@@ -1,0 +1,50 @@
+{"after_ms":0,"event":{"seq":1,"type":"run.started","scope":"run:r3","source":"human","actor":"human","payload":{"run_id":"r3","actor":"team","budget_usd":8,"blueprint_sha":"5f6a7b8c","members":[{"name":"scout","role":"investigator","model":"claude-opus-5","advisory":true,"tools":["read","bash"],"activation":"parallel","stages":["execute"]},{"name":"builder","role":"implementer","model":"claude-sonnet-5","tools":["write","bash"],"activation":"parallel","stages":["execute"]},{"name":"tester","role":"verifier","model":"claude-sonnet-5","tools":["bash"],"activation":"after:builder","stages":["execute"]},{"name":"scribe","role":"documenter","model":"claude-haiku-4-5-20251001","tools":["read","write"],"activation":"coalesce","stages":["execute"]}]}}}
+{"after_ms":0,"event":{"seq":2,"type":"stage.entered","scope":"run:r3","source":"runtime","payload":{"stage":"execute","index":0}}}
+{"after_ms":80,"event":{"seq":3,"type":"run.prompt","scope":"run:r3","source":"human","actor":"human","payload":{"text":"rotate the session tokens across the team: the migration and the test that proves it, in one run"}}}
+{"after_ms":50,"event":{"seq":4,"type":"agent.activated","scope":"run:r3","source":"runtime","actor":"scout","payload":{}}}
+{"after_ms":10,"event":{"seq":5,"type":"agent.activated","scope":"run:r3","source":"runtime","actor":"builder","payload":{}}}
+{"after_ms":10,"event":{"seq":6,"type":"agent.activated","scope":"run:r3","source":"runtime","actor":"tester","payload":{}}}
+{"after_ms":10,"event":{"seq":7,"type":"agent.activated","scope":"run:r3","source":"runtime","actor":"scribe","payload":{}}}
+{"after_ms":40,"event":{"seq":8,"type":"llm.turn_started","scope":"run:r3","source":"runtime","actor":"scout","payload":{"turn":1}}}
+{"after_ms":60,"event":{"seq":9,"type":"llm.part","scope":"run:r3","source":"agent","actor":"scout","payload":{"part_id":"s1","kind":"text","index":0}}}
+{"after_ms":140,"event":{"seq":10,"type":"llm.delta","scope":"run:r3","source":"agent","actor":"scout","payload":{"part_id":"s1","text":"Reading the session store first. Rotation has to keep the previous key valid for one window or every live session dies at deploy.\n"}}}
+{"after_ms":120,"event":{"seq":11,"type":"llm.part_done","scope":"run:r3","source":"agent","actor":"scout","payload":{"part_id":"s1"}}}
+{"after_ms":40,"event":{"seq":12,"type":"tool.call","scope":"run:r3","source":"agent","actor":"scout","payload":{"tool":"read","args":{"path":"internal/auth/session.go"}}}}
+{"after_ms":30,"event":{"seq":13,"type":"llm.turn_started","scope":"run:r3","source":"runtime","actor":"builder","payload":{"turn":1}}}
+{"after_ms":50,"event":{"seq":14,"type":"llm.part","scope":"run:r3","source":"agent","actor":"builder","payload":{"part_id":"b1","kind":"text","index":1}}}
+{"after_ms":130,"event":{"seq":15,"type":"llm.delta","scope":"run:r3","source":"agent","actor":"builder","payload":{"part_id":"b1","text":"Writing the migration while scout reads. Nothing I touch is in the file they have open.\n"}}}
+{"after_ms":110,"event":{"seq":16,"type":"llm.part_done","scope":"run:r3","source":"agent","actor":"builder","payload":{"part_id":"b1"}}}
+{"after_ms":40,"event":{"seq":17,"type":"tool.call","scope":"run:r3","source":"agent","actor":"scout","payload":{"tool":"bash","args":{"cmd":"go test ./internal/auth -run TestRotate -count=1"}}}}
+{"after_ms":30,"event":{"seq":18,"type":"tool.call","scope":"run:r3","source":"agent","actor":"builder","payload":{"tool":"bash","args":{"cmd":"go build ./..."}}}}
+{"after_ms":220,"event":{"seq":19,"type":"tool.call_completed","scope":"run:r3","source":"runtime","actor":"scout","payload":{"tool":"read","result":{"lines":214,"summary":"read 214 lines"}}}}
+{"after_ms":900,"event":{"seq":20,"type":"tool.call_completed","scope":"run:r3","source":"runtime","actor":"scout","payload":{"tool":"bash","result":{"exit_code":1,"lines":12,"summary":"FAIL internal/auth: TestRotate: previous key rejected after rotation"}}}}
+{"after_ms":260,"event":{"seq":21,"type":"tool.call_completed","scope":"run:r3","source":"runtime","actor":"builder","payload":{"tool":"bash","result":{"exit_code":0,"lines":1,"summary":"build ok, 0 packages rebuilt"}}}}
+{"after_ms":80,"event":{"seq":22,"type":"llm.part","scope":"run:r3","source":"agent","actor":"scout","payload":{"part_id":"s2","kind":"text","index":2}}}
+{"after_ms":150,"event":{"seq":23,"type":"llm.delta","scope":"run:r3","source":"agent","actor":"scout","payload":{"part_id":"s2","text":"My test failed and builder's build passed. Each result found its own call: the fold matches a result to the oldest open call by the same actor, which is what it has to do the moment two members run `bash` at once. What the transcript still cannot tell you is which of us owns which line, because the block draws no actor.\n"}}}
+{"after_ms":120,"event":{"seq":24,"type":"llm.part_done","scope":"run:r3","source":"agent","actor":"scout","payload":{"part_id":"s2"}}}
+{"after_ms":60,"event":{"seq":25,"type":"tool.call","scope":"run:r3","source":"agent","actor":"builder","payload":{"tool":"write","args":{"path":"internal/auth/migrate_tokens.go","bytes":2048}}}}
+{"after_ms":90,"event":{"seq":26,"type":"tool.call_denied","scope":"run:r3","source":"runtime","actor":"builder","payload":{"tool":"write","policy":"ask"}}}
+{"after_ms":40,"event":{"seq":27,"type":"inbox.created","scope":"run:r3","source":"runtime","actor":"builder","payload":{"inbox_id":"inbox-t1","kind":"tool_approval","question":"approve write for builder? internal/auth/migrate_tokens.go","on_timeout":"deny"}}}
+{"after_ms":20,"event":{"seq":28,"type":"agent.blocked","scope":"run:r3","source":"runtime","actor":"builder","payload":{"blocked_on":"approval","blocked_ref":{"inbox_id":"inbox-t1","tool":"write","path":"internal/auth/migrate_tokens.go"}}}}
+{"await":"inbox-t1"}
+{"after_ms":2400,"event":{"seq":29,"type":"inbox.replied","scope":"run:r3","source":"human","actor":"human","payload":{"inbox_id":"inbox-t1","text":"allow"}}}
+{"after_ms":40,"event":{"seq":30,"type":"agent.unblocked","scope":"run:r3","source":"runtime","actor":"builder","payload":{}}}
+{"after_ms":60,"event":{"seq":31,"type":"tool.call","scope":"run:r3","source":"agent","actor":"builder","payload":{"tool":"write","args":{"path":"internal/auth/migrate_tokens.go","bytes":2048}}}}
+{"after_ms":180,"event":{"seq":32,"type":"tool.call_completed","scope":"run:r3","source":"runtime","actor":"builder","payload":{"tool":"write","result":{"exit_code":0,"lines":78,"summary":"wrote 78 lines"}}}}
+{"after_ms":50,"event":{"seq":33,"type":"llm.turn_started","scope":"run:r3","source":"runtime","actor":"tester","payload":{"turn":1}}}
+{"after_ms":40,"event":{"seq":34,"type":"llm.part","scope":"run:r3","source":"agent","actor":"tester","payload":{"part_id":"t1","kind":"thinking","index":3,"effort":"medium"}}}
+{"after_ms":160,"event":{"seq":35,"type":"llm.delta","scope":"run:r3","source":"agent","actor":"tester","payload":{"part_id":"t1","text":"The migration exists now, so the failing rotation test is the thing to run, not the whole tree — but scout's failure could be the old key path, so run everything once."}}}
+{"after_ms":190,"event":{"seq":36,"type":"llm.part_done","scope":"run:r3","source":"agent","actor":"tester","payload":{"part_id":"t1"}}}
+{"after_ms":40,"event":{"seq":37,"type":"tool.call","scope":"run:r3","source":"agent","actor":"tester","payload":{"tool":"bash","args":{"cmd":"go test ./... -count=1"}}}}
+{"after_ms":1900,"event":{"seq":38,"type":"tool.call_completed","scope":"run:r3","source":"runtime","actor":"tester","payload":{"tool":"bash","result":{"exit_code":0,"lines":9,"summary":"ok  internal/auth  1.902s"}}}}
+{"after_ms":70,"event":{"seq":39,"type":"llm.part","scope":"run:r3","source":"agent","actor":"tester","payload":{"part_id":"t2","kind":"text","index":4}}}
+{"after_ms":140,"event":{"seq":40,"type":"llm.delta","scope":"run:r3","source":"agent","actor":"tester","payload":{"part_id":"t2","text":"Green. The rotation keeps the previous key for one window, and scribe has nothing to write up because nobody changed the public interface.\n"}}}
+{"after_ms":110,"event":{"seq":41,"type":"llm.part_done","scope":"run:r3","source":"agent","actor":"tester","payload":{"part_id":"t2"}}}
+{"after_ms":30,"event":{"seq":42,"type":"llm.response","scope":"run:r3","source":"runtime","actor":"scout","payload":{"cost_usd":0.214,"tokens_in":11402,"tokens_out":388,"model":"claude-opus-5"}}}
+{"after_ms":10,"event":{"seq":43,"type":"llm.response","scope":"run:r3","source":"runtime","actor":"builder","payload":{"cost_usd":0.318,"tokens_in":15980,"tokens_out":902,"model":"claude-opus-5"}}}
+{"after_ms":10,"event":{"seq":44,"type":"llm.response","scope":"run:r3","source":"runtime","actor":"tester","payload":{"cost_usd":0.226,"tokens_in":12044,"tokens_out":301,"model":"claude-opus-5"}}}
+{"after_ms":20,"event":{"seq":45,"type":"agent.turn_done","scope":"run:r3","source":"agent","actor":"scout","payload":{}}}
+{"after_ms":10,"event":{"seq":46,"type":"agent.turn_done","scope":"run:r3","source":"agent","actor":"builder","payload":{}}}
+{"after_ms":10,"event":{"seq":47,"type":"agent.turn_done","scope":"run:r3","source":"agent","actor":"tester","payload":{}}}
+{"after_ms":40,"event":{"seq":48,"type":"run.quiescent","scope":"run:r3","source":"runtime","payload":{"stage":"execute","diagnosis":"no pending effects: scout, builder and tester submitted; scribe was activated and never spoke, and stage \"execute\" advances when all four submit, so the run is waiting on scribe or on a steer"}}}
+{"await":"prompt"}

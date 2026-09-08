@@ -1,0 +1,27 @@
+{"after_ms":0,"event":{"seq":1,"type":"run.started","scope":"run:r10","source":"human","actor":"human","payload":{"run_id":"r10","actor":"scribe","budget_usd":3,"blueprint_sha":"a1b2c3d4"}}}
+{"after_ms":0,"event":{"seq":2,"type":"stage.entered","scope":"run:r10","source":"runtime","payload":{"stage":"execute","index":0}}}
+{"after_ms":90,"event":{"seq":3,"type":"run.prompt","scope":"run:r10","source":"human","actor":"human","payload":{"text":"write the 0.4 release notes: what changed, what a reader has to do about it, and link the event contract"}}}
+{"after_ms":60,"event":{"seq":4,"type":"agent.activated","scope":"run:r10","source":"runtime","actor":"scribe","payload":{}}}
+{"after_ms":40,"event":{"seq":5,"type":"llm.turn_started","scope":"run:r10","source":"runtime","actor":"scribe","payload":{"turn":1}}}
+{"after_ms":30,"event":{"seq":6,"type":"llm.part","scope":"run:r10","source":"agent","actor":"scribe","payload":{"part_id":"p1","kind":"thinking","index":0,"effort":"low"}}}
+{"after_ms":60,"event":{"seq":7,"type":"llm.delta","scope":"run:r10","source":"agent","actor":"scribe","payload":{"part_id":"p1","text":"The strict loader is the only change that breaks a file somebody already has, so it goes first and it gets the instruction."}}}
+{"after_ms":180,"event":{"seq":8,"type":"llm.part_done","scope":"run:r10","source":"agent","actor":"scribe","payload":{"part_id":"p1"}}}
+{"after_ms":40,"event":{"seq":9,"type":"llm.part","scope":"run:r10","source":"agent","actor":"scribe","payload":{"part_id":"p2","kind":"text","index":1}}}
+{"after_ms":70,"event":{"seq":10,"type":"llm.delta","scope":"run:r10","source":"agent","actor":"scribe","payload":{"part_id":"p2","text":"Reading the changelog since 0.3.\n"}}}
+{"after_ms":150,"event":{"seq":11,"type":"llm.part_done","scope":"run:r10","source":"agent","actor":"scribe","payload":{"part_id":"p2"}}}
+{"after_ms":40,"event":{"seq":12,"type":"tool.call","scope":"run:r10","source":"agent","actor":"scribe","payload":{"tool":"read","args":{"path":"CHANGELOG.md"}}}}
+{"after_ms":520,"event":{"seq":13,"type":"tool.call_completed","scope":"run:r10","source":"runtime","actor":"scribe","payload":{"tool":"read","result":{"lines":96,"summary":"read 96 lines"}}}}
+{"after_ms":80,"event":{"seq":14,"type":"llm.part","scope":"run:r10","source":"agent","actor":"scribe","payload":{"part_id":"p3","kind":"text","index":2}}}
+{"after_ms":90,"event":{"seq":15,"type":"llm.delta","scope":"run:r10","source":"agent","actor":"scribe","payload":{"part_id":"p3","text":"# arxi 0.4\n\n"}}}
+{"after_ms":110,"event":{"seq":16,"type":"llm.delta","scope":"run:r10","source":"agent","actor":"scribe","payload":{"part_id":"p3","text":"The loader is *strict"}}}
+{"after_ms":140,"event":{"seq":17,"type":"llm.delta","scope":"run:r10","source":"agent","actor":"scribe","payload":{"part_id":"p3","text":"* now, so a **malformed line** is an error rather than a warning, and `Load` reports every problem in a file at once. See [the event contract]"}}}
+{"after_ms":160,"event":{"seq":18,"type":"llm.delta","scope":"run:r10","source":"agent","actor":"scribe","payload":{"part_id":"p3","text":"(https://arxi.dev/events) for the shapes it accepts.\n\n"}}}
+{"after_ms":150,"event":{"seq":19,"type":"llm.delta","scope":"run:r10","source":"agent","actor":"scribe","payload":{"part_id":"p3","text":"> A recording is a fact about a run.\n> > Which is why nothing rewrites one.\n\n"}}}
+{"after_ms":170,"event":{"seq":20,"type":"llm.delta","scope":"run:r10","source":"agent","actor":"scribe","payload":{"part_id":"p3","text":"1. Regenerate your fixtures: `arxi check *.ndjson` fails on anything the\n   0.3 loader let through.\n2. Read the contract above before writing one by hand.\n3. Keep the epoch fixed if you golden a frame.\n\n"}}}
+{"after_ms":150,"event":{"seq":21,"type":"llm.delta","scope":"run:r10","source":"agent","actor":"scribe","payload":{"part_id":"p3","text":"0.4.1 will follow with the narrow table form; nothing here is source-breaking.\n\nThe fold is O(steps * lines), so 2 * 31 lines is cheap and 4 * 550 is not.\n\n"}}}
+{"after_ms":160,"event":{"seq":22,"type":"llm.delta","scope":"run:r10","source":"agent","actor":"scribe","payload":{"part_id":"p3","text":"Still open:\n\n- [x] the strict loader\n- [ ] the narrow table form\n- [ ] the status line\n\nThe numbers are from the width sweep [1] and the fold benchmark [2].\n"}}}
+{"after_ms":120,"event":{"seq":23,"type":"llm.part_done","scope":"run:r10","source":"agent","actor":"scribe","payload":{"part_id":"p3"}}}
+{"after_ms":40,"event":{"seq":24,"type":"llm.response","scope":"run:r10","source":"runtime","actor":"scribe","payload":{"cost_usd":0.2114,"tokens_in":21044,"tokens_out":938,"model":"claude-opus-5"}}}
+{"after_ms":20,"event":{"seq":25,"type":"agent.turn_done","scope":"run:r10","source":"agent","actor":"scribe","payload":{}}}
+{"after_ms":30,"event":{"seq":26,"type":"run.quiescent","scope":"run:r10","source":"runtime","payload":{"stage":"execute","diagnosis":"no pending effects: scribe wrote the notes and finished its turn, and stage \"execute\" advances when every member submits; scribe has not submitted, so the run is waiting on a submit or on a steer"}}}
+{"await":"prompt"}

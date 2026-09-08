@@ -1,0 +1,33 @@
+{"after_ms":0,"event":{"seq":1,"type":"run.started","scope":"run:r5","source":"human","actor":"human","payload":{"run_id":"r5","actor":"team","budget_usd":4,"blueprint_sha":"1a2b3c4d"}}}
+{"after_ms":0,"event":{"seq":2,"type":"stage.entered","scope":"run:r5","source":"runtime","payload":{"stage":"execute","index":0}}}
+{"after_ms":80,"event":{"seq":3,"type":"run.prompt","scope":"run:r5","source":"human","actor":"human","payload":{"text":"you both need internal/auth/session.go: whoever gets there second waits, I do not want a clobber"}}}
+{"after_ms":50,"event":{"seq":4,"type":"agent.activated","scope":"run:r5","source":"runtime","actor":"builder","payload":{}}}
+{"after_ms":10,"event":{"seq":5,"type":"agent.activated","scope":"run:r5","source":"runtime","actor":"tester","payload":{}}}
+{"after_ms":40,"event":{"seq":6,"type":"llm.turn_started","scope":"run:r5","source":"runtime","actor":"builder","payload":{"turn":1}}}
+{"after_ms":40,"event":{"seq":7,"type":"llm.part","scope":"run:r5","source":"agent","actor":"builder","payload":{"part_id":"b1","kind":"text","index":0}}}
+{"after_ms":150,"event":{"seq":8,"type":"llm.delta","scope":"run:r5","source":"agent","actor":"builder","payload":{"part_id":"b1","text":"Taking the write lock on the session store before I touch it, so tester waits instead of overwriting me.\n"}}}
+{"after_ms":120,"event":{"seq":9,"type":"llm.part_done","scope":"run:r5","source":"agent","actor":"builder","payload":{"part_id":"b1"}}}
+{"after_ms":40,"event":{"seq":10,"type":"lock.acquired","scope":"run:r5","source":"runtime","actor":"builder","payload":{"resource":"file:internal/auth/session.go","holder":"builder","mode":"write"}}}
+{"after_ms":30,"event":{"seq":11,"type":"tool.call","scope":"run:r5","source":"agent","actor":"builder","payload":{"tool":"write","args":{"path":"internal/auth/session.go","bytes":3072}}}}
+{"after_ms":60,"event":{"seq":12,"type":"llm.turn_started","scope":"run:r5","source":"runtime","actor":"tester","payload":{"turn":1}}}
+{"after_ms":40,"event":{"seq":13,"type":"llm.part","scope":"run:r5","source":"agent","actor":"tester","payload":{"part_id":"t1","kind":"text","index":1}}}
+{"after_ms":140,"event":{"seq":14,"type":"llm.delta","scope":"run:r5","source":"agent","actor":"tester","payload":{"part_id":"t1","text":"I need the same file: the rotation test has to call an unexported helper, so the hook goes in next to it.\n"}}}
+{"after_ms":110,"event":{"seq":15,"type":"llm.part_done","scope":"run:r5","source":"agent","actor":"tester","payload":{"part_id":"t1"}}}
+{"after_ms":50,"event":{"seq":16,"type":"resource.conflict","scope":"run:r5","source":"runtime","actor":"tester","payload":{"resource":"file:internal/auth/session.go","holder":"builder","waiter":"tester","wanted":"write"}}}
+{"after_ms":20,"event":{"seq":17,"type":"agent.blocked","scope":"run:r5","source":"runtime","actor":"tester","payload":{"blocked_on":"lock","blocked_ref":{"resource":"file:internal/auth/session.go","holder":"builder","mode":"write"}}}}
+{"after_ms":1200,"event":{"seq":18,"type":"tool.call_completed","scope":"run:r5","source":"runtime","actor":"builder","payload":{"tool":"write","result":{"exit_code":0,"lines":46,"summary":"wrote 46 lines"}}}}
+{"after_ms":30,"event":{"seq":19,"type":"lock.released","scope":"run:r5","source":"runtime","actor":"builder","payload":{"resource":"file:internal/auth/session.go","holder":"builder","mode":"write"}}}
+{"after_ms":20,"event":{"seq":20,"type":"agent.unblocked","scope":"run:r5","source":"runtime","actor":"tester","payload":{}}}
+{"after_ms":20,"event":{"seq":21,"type":"lock.acquired","scope":"run:r5","source":"runtime","actor":"tester","payload":{"resource":"file:internal/auth/session.go","holder":"tester","mode":"write"}}}
+{"after_ms":40,"event":{"seq":22,"type":"tool.call","scope":"run:r5","source":"agent","actor":"tester","payload":{"tool":"write","args":{"path":"internal/auth/session.go","bytes":3288}}}}
+{"after_ms":260,"event":{"seq":23,"type":"tool.call_completed","scope":"run:r5","source":"runtime","actor":"tester","payload":{"tool":"write","result":{"exit_code":0,"lines":12,"summary":"wrote 12 lines"}}}}
+{"after_ms":30,"event":{"seq":24,"type":"lock.released","scope":"run:r5","source":"runtime","actor":"tester","payload":{"resource":"file:internal/auth/session.go","holder":"tester","mode":"write"}}}
+{"after_ms":60,"event":{"seq":25,"type":"llm.part","scope":"run:r5","source":"agent","actor":"tester","payload":{"part_id":"t2","kind":"text","index":2}}}
+{"after_ms":150,"event":{"seq":26,"type":"llm.delta","scope":"run:r5","source":"agent","actor":"tester","payload":{"part_id":"t2","text":"Waited 1.2s and wrote on top of builder's version, not over it. The wait is the whole point: two writes to one file in a run with no lock is the bug this scenario exists to make boring.\n"}}}
+{"after_ms":120,"event":{"seq":27,"type":"llm.part_done","scope":"run:r5","source":"agent","actor":"tester","payload":{"part_id":"t2"}}}
+{"after_ms":30,"event":{"seq":28,"type":"llm.response","scope":"run:r5","source":"runtime","actor":"builder","payload":{"cost_usd":0.1904,"tokens_in":9820,"tokens_out":602,"model":"claude-opus-5"}}}
+{"after_ms":10,"event":{"seq":29,"type":"llm.response","scope":"run:r5","source":"runtime","actor":"tester","payload":{"cost_usd":0.1451,"tokens_in":8104,"tokens_out":288,"model":"claude-opus-5"}}}
+{"after_ms":20,"event":{"seq":30,"type":"agent.turn_done","scope":"run:r5","source":"agent","actor":"builder","payload":{}}}
+{"after_ms":10,"event":{"seq":31,"type":"agent.turn_done","scope":"run:r5","source":"agent","actor":"tester","payload":{}}}
+{"after_ms":40,"event":{"seq":32,"type":"run.quiescent","scope":"run:r5","source":"runtime","payload":{"stage":"execute","diagnosis":"no pending effects and no lock held: builder and tester both submitted after serializing on file:internal/auth/session.go, so stage \"execute\" is ready to advance and the run is waiting on a prompt or a steer"}}}
+{"await":"prompt"}

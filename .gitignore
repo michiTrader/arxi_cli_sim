@@ -1,0 +1,10 @@
+# Build artifacts: the player is two `go build` commands away and binaries
+# do not survive a merge conflict review.
+/arxi-sim
+/arxi-sim.exe
+/bin/
+
+# Per-machine agent settings. Never commit: these carry live credentials,
+# and a token pushed here is a token revoked the hard way.
+/.claude/
+/.codex/
