@@ -103,6 +103,15 @@ func LoadDocument(path string) (*Document, error) {
 		d.fingerprint = fingerprint(data, true)
 		return d, nil
 	case errors.Is(err, fs.ErrNotExist):
+		// Windows reports a path below a regular file as not-exist instead of
+		// the not-a-directory error Unix gives, so the parent is checked here:
+		// handing back an empty document would promise a Save that cannot
+		// succeed, because the parent it would create is already a file.
+		if parent := filepath.Dir(path); parent != path {
+			if info, err := os.Lstat(parent); err == nil && !info.IsDir() {
+				return nil, &UnsafePathError{Path: path, Reason: "parent is not a directory"}
+			}
+		}
 		return newDocument(path, nil), nil
 	default:
 		return nil, err
