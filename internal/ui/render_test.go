@@ -8,11 +8,76 @@ import (
 	"strings"
 	"testing"
 
+	"arxi.local/sim/internal/event"
 	"arxi.local/sim/internal/scenario"
 	"arxi.local/sim/internal/state"
 )
 
-// These tests are the reason the renderer returns a Frame instead of writing to a
+type scheduledWidget struct {
+	name     string
+	slot     Slot
+	fallback Slot
+	rows     []Line
+	animated bool
+	next     int
+}
+
+func (w scheduledWidget) Name() string                   { return w.name }
+func (w scheduledWidget) Slot() Slot                     { return w.slot }
+func (w scheduledWidget) Fallback() Slot                 { return w.fallback }
+func (w scheduledWidget) Animated() bool                 { return w.animated }
+func (w scheduledWidget) NextVisualChange() int          { return w.next }
+func (w scheduledWidget) Render(int, int, Glyphs) []Line { return w.rows }
+
+type legacyScheduledWidget struct {
+	name     string
+	slot     Slot
+	rows     []Line
+	animated bool
+}
+
+func (w legacyScheduledWidget) Name() string                   { return w.name }
+func (w legacyScheduledWidget) Slot() Slot                     { return w.slot }
+func (w legacyScheduledWidget) Fallback() Slot                 { return "" }
+func (w legacyScheduledWidget) Animated() bool                 { return w.animated }
+func (w legacyScheduledWidget) Render(int, int, Glyphs) []Line { return w.rows }
+
+func TestFrameSchedulesOnlyVisibleDrawables(t *testing.T) {
+	st := state.New()
+	in := NewInput()
+	in.Shine = Shimmer{Style: InputShine, Phase: 8, Period: 296, Travel: 8}
+	r := NewRenderer()
+	r.Widgets = []Widget{
+		scheduledWidget{name: "slow", slot: SlotBelowInput, rows: []Line{{{Text: "slow"}}}, animated: true, next: 7},
+		scheduledWidget{name: "fast", slot: SlotBottom, rows: []Line{{{Text: "fast"}}}, animated: true, next: 3},
+		legacyScheduledWidget{name: "legacy", slot: SlotAboveInput, rows: []Line{{{Text: "legacy"}}}, animated: true},
+		scheduledWidget{name: "empty", slot: SlotBottom, animated: true, next: 1},
+		scheduledWidget{name: "dropped", slot: SlotRight, animated: true, next: 1, rows: []Line{{{Text: "drop"}}}},
+	}
+	f := r.Render(st, in, Viewport{Width: 72, Height: 20})
+	if f.NextVisualChange != 1 {
+		t.Fatalf("frame reports %d ticks, want the legacy widget's one-tick fallback", f.NextVisualChange)
+	}
+
+	// The precise interface wins over Animated: false, and the dark input deadline wins
+	// over slower visible widgets once the legacy row is removed.
+	r.Widgets = r.Widgets[:2]
+	f = r.Render(st, in, Viewport{Width: 72, Height: 20})
+	if f.NextVisualChange != 3 {
+		t.Fatalf("frame reports %d ticks, want the earliest visible deadline 3", f.NextVisualChange)
+	}
+
+	// At one row the final top trim removes every animated row except the bottom widget.
+	r.Widgets = []Widget{
+		scheduledWidget{name: "trimmed", slot: SlotTop, rows: []Line{{{Text: "trimmed"}}}, next: 1},
+		scheduledWidget{name: "kept", slot: SlotBottom, rows: []Line{{{Text: "kept"}}}, next: 9},
+	}
+	f = r.Render(st, nil, Viewport{Width: 72, Height: 1, FixedTop: true})
+	if f.NextVisualChange != 9 {
+		t.Fatalf("trimmed frame reports %d ticks, want only the surviving row's 9", f.NextVisualChange)
+	}
+}
+
 // terminal. Everything that matters about a frame — that it fits, that a sealed
 // line never moves, that a half-arrived fence still draws as code — is a property
 // of a string, checkable without a tty, on any machine, in milliseconds.
@@ -1087,34 +1152,145 @@ func TestChromeTallerThanTheScreenGivesUpItsTop(t *testing.T) {
 	}
 }
 
-// TestGoldenFirstConversation pins the whole transcript. Run with -update to
-// rewrite it, then read the diff: this file is the interface, and a change to it
-// should be as reviewable as a change to the code.
+// TestGoldenFirstConversation pins the whole transcript, once per output level. Run
+// with -update to rewrite them, then read the diff: this file is the interface, and a
+// change to it should be as reviewable as a change to the code.
 //
 // No height, because "the whole transcript" is a claim a frame with a height cannot make:
-// it holds a screenful and the rest of the conversation is above it, unpinned. This golden
-// is the document, which is also what --instant prints and what a pipe receives.
+// it holds a screenful and the rest of the conversation is above it, unpinned. These goldens
+// are the document, which is also what --instant prints and what a pipe receives.
+//
+// The unnamed golden is the standard level and keeps the name it has always had, because
+// it pins the look the transcript had before there were levels. The other two are named
+// for the level they pin: compact is what a session opens at, and full is what state kept.
 func TestGoldenFirstConversation(t *testing.T) {
+	for _, lv := range []struct {
+		suffix string
+		detail DetailLevel
+	}{
+		{"", DetailStandard},
+		{".compact", DetailCompact},
+		{".full", DetailFull},
+	} {
+		st, _ := play(t, firstConversation, -1)
+		r := NewRenderer()
+		r.Detail = lv.detail
+		in := NewInput()
+		got := render(r, st, in, docViewport(72)).Plain() + "\n"
+		path := filepath.Join("testdata", "01-first-conversation.72"+lv.suffix+".txt")
+		if *update {
+			if err := os.MkdirAll("testdata", 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(path, []byte(got), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			t.Log("wrote " + path)
+			continue
+		}
+		want, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("%v (run: go test ./internal/ui -update)", err)
+		}
+		if got != string(want) {
+			t.Errorf("frame differs from %s\n--- got ---\n%s\n--- want ---\n%s", path, got, want)
+		}
+	}
+}
+
+// TestAboveInputWidgetsKeepTheirDistanceFromTheProse pins the row of air between the
+// transcript and the widget block above the input. The last line of prose and the first
+// line of chrome are about different things — the run's own words, then the tasks list —
+// and butted together they read as one paragraph.
+func TestAboveInputWidgetsKeepTheirDistanceFromTheProse(t *testing.T) {
+	st, _ := play(t, firstConversation, -1)
+	st.Tasks = []*state.Task{{Title: "a task", Status: event.TaskCompleted}}
+	r := NewRenderer()
+	r.Widgets = []Widget{TasksWidget{St: st}}
+	f := r.Render(st, NewInput(), docViewport(72))
+	live := f.Live
+	tasks := -1
+	for i, l := range live {
+		if strings.Contains(l.Text(), "Tasks 1 (1 done") {
+			tasks = i
+			break
+		}
+	}
+	if tasks <= 0 {
+		t.Fatalf("tasks summary not in the live frame:\n%s", f.Plain())
+	}
+	if strings.TrimSpace(live[tasks-1].Text()) != "" {
+		t.Errorf("no blank row between the transcript and the tasks block:\n%s", f.Plain())
+	}
+}
+
+// TestScrollbackPinsTheWindowToTheTail holds the window rules the phone's surface runs
+// under. The tail is the window and a scrolled request cannot move it, because the reader's
+// scroll there is the terminal's own history; the window's top never retreats below where
+// the caller says history ends, because a screen that grew would otherwise walk it back over
+// rows history already holds; and the one scroll the renderer does answer is the caller's
+// seam, which may park the window short of the tail or past it, because only the caller
+// knows why it is asking.
+func TestScrollbackPinsTheWindowToTheTail(t *testing.T) {
 	st, _ := play(t, firstConversation, -1)
 	r := NewRenderer()
+	base := shortViewport(72)
+	base.Scrollback = true
+
+	tail := r.Render(st, NewInput(), base)
+	if !tail.Scrollback {
+		t.Fatal("the frame did not say it belongs to the stream")
+	}
+	if tail.Scroll.Below != 0 {
+		t.Fatalf("a scrollback window left %d rows under it", tail.Scroll.Below)
+	}
+
+	// A taller screen drops the tail, not the top: the window holds where history ends
+	// and the fill below the input bar takes the difference, as a young conversation's
+	// always has. The floor is the caller's own stored top — ScrollTop is what the app
+	// keeps it in — because a screen that grows must not walk the top back over rows
+	// the history already holds; retreating would be printing them twice.
+	floor := tail.Scroll.Above
+	taller := base
+	taller.Height += 10
+	taller.ScrollTop = floor
+	got := r.Render(st, NewInput(), taller)
+	if got.Scroll.Above != floor {
+		t.Fatalf("a taller screen walked the window's top to row %d; history ends at %d", got.Scroll.Above, floor)
+	}
+	if got.Scroll.Below != 0 || len(got.Live) != taller.Height {
+		t.Fatalf("the held window came out Below=%d with %d live rows on a %d-row screen", got.Scroll.Below, len(got.Live), taller.Height)
+	}
+
+	// The seam, in both of its shapes: short of the tail, laying rows down that are
+	// about to be committed, and past it, where a trim has eaten the screen's top and
+	// the window comes out shorter than the screen. Both are the caller's to ask for.
+	seam := base
+	seam.Scrolled, seam.ScrollTop = true, max(floor-2, 0)
+	got = r.Render(st, NewInput(), seam)
+	if got.Scroll.Above != seam.ScrollTop || got.Scroll.Below == 0 {
+		t.Fatalf("a seam short of the tail landed at %d Below=%d; want %d with rows under it", got.Scroll.Above, got.Scroll.Below, seam.ScrollTop)
+	}
+	overshot := base
+	overshot.Scrolled, overshot.ScrollTop = true, tail.Scroll.Above+3
+	got = r.Render(st, NewInput(), overshot)
+	if got.Scroll.Above != overshot.ScrollTop || got.Scroll.Below != 0 {
+		t.Fatalf("a seam past the tail landed at %d Below=%d; want %d and none", got.Scroll.Above, got.Scroll.Below, overshot.ScrollTop)
+	}
+}
+
+// TestScrollbackNamesWhatATrimEats covers the one frame where the screen cannot hold the
+// chrome: the trim eats from the top, and on a scrollback surface what it eats has to be
+// named, because the emitter commits the rows the screen's top leaves behind. A trim that
+// reaches the chrome leaves no honest answer — the top of the screen is not a transcript
+// row — and a negative Above is how the frame says so.
+func TestScrollbackNamesWhatATrimEats(t *testing.T) {
+	st, _ := play(t, firstConversation, -1)
 	in := NewInput()
-	got := render(r, st, in, docViewport(72)).Plain() + "\n"
-	path := filepath.Join("testdata", "01-first-conversation.72.txt")
-	if *update {
-		if err := os.MkdirAll("testdata", 0o755); err != nil {
-			t.Fatal(err)
-		}
-		if err := os.WriteFile(path, []byte(got), 0o644); err != nil {
-			t.Fatal(err)
-		}
-		t.Log("wrote " + path)
-		return
-	}
-	want, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatalf("%v (run: go test ./internal/ui -update)", err)
-	}
-	if got != string(want) {
-		t.Errorf("frame differs from %s\n--- got ---\n%s\n--- want ---\n%s", path, got, want)
+	in.SetText(strings.Repeat("a prompt tall enough to fill any screen around it, ", 8))
+	vp := Viewport{Width: 72, Height: 3, Scrollback: true}
+	f := NewRenderer().Render(st, in, vp)
+	if f.Scroll.Above != -1 {
+		t.Fatalf("a screen the chrome alone fills reported Above=%d; no honest answer exists there", f.Scroll.Above)
 	}
 }

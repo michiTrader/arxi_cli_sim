@@ -1,0 +1,1 @@
+{"valid":true,"envelope":{"type":"actions.invoke","id":"invoke-1","payload":{"action":"ping","args":"now"}}}

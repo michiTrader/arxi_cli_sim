@@ -416,11 +416,11 @@ func TestTasksWidgetSummarizesLiveCounts(t *testing.T) {
 	}}
 	wd := TasksWidget{St: st}
 	rows := wd.Render(80, 0, DefaultGlyphs())
-	if len(rows) != 1 || rows[0].Text() != "Tasks 2/5 · 1 active · 2 pending · /tasks" {
+	if len(rows) != 1 || rows[0].Text() != "  Tasks 5 (2 done, 1 in progress, 2 open) · /tasks" {
 		t.Fatalf("wide Tasks summary = %q", plain(rows))
 	}
 	st.Tasks[2].Status = event.TaskCompleted
-	if got := wd.Render(80, 0, DefaultGlyphs())[0].Text(); got != "Tasks 3/5 · 0 active · 2 pending · /tasks" {
+	if got := wd.Render(80, 0, DefaultGlyphs())[0].Text(); got != "  Tasks 5 (3 done, 0 in progress, 2 open) · /tasks" {
 		t.Fatalf("live Tasks summary = %q", got)
 	}
 	if wd.Name() != "tasks" || wd.Slot() != SlotAboveInput || wd.Fallback() != SlotBelowInput || wd.Animated() {
@@ -453,7 +453,12 @@ func TestTasksWidgetDegradesWithoutOverflow(t *testing.T) {
 			t.Errorf("width %d ends in a space: %q", w, row.Text())
 		}
 	}
-	for _, want := range []string{"Tasks 1/3 · 1 active · 1 pending · /tasks", "Tasks 1/3 · 1 active · /tasks", "Tasks 1/3 · /tasks", "Tasks 1/3", "Tasks"} {
+	for _, want := range []string{
+		"  Tasks 3 (1 done, 1 in progress, 1 open) · /tasks",
+		"  Tasks 3 (1 done, 1 in progress) · /tasks",
+		"  Tasks 3 (1 done) · /tasks",
+		"  Tasks 3", "  Tasks",
+	} {
 		if !seen[want] {
 			t.Errorf("responsive ladder never drew %q", want)
 		}
@@ -468,6 +473,145 @@ func TestTasksWidgetHidesWithoutTasks(t *testing.T) {
 	}
 	if rows := (TasksWidget{St: &state.State{Tasks: []*state.Task{{Status: event.TaskPending}}}}).Render(0, 0, DefaultGlyphs()); rows != nil {
 		t.Errorf("zero-width Tasks widget drew %q", plain(rows))
+	}
+}
+
+// TestTasksWidgetPanelOrdersAndBounds is the open state's whole shape: the summary
+// as a header, active tasks above pending above completed regardless of the order
+// the events arrived in, one row per task in the square-and-check vocabulary.
+func TestTasksWidgetPanelOrdersAndBounds(t *testing.T) {
+	st := &state.State{Tasks: []*state.Task{
+		{Title: "third", Status: event.TaskCompleted},
+		{Title: "first", Status: event.TaskActive},
+		{Title: "second", Status: event.TaskPending},
+	}}
+	wd := TasksWidget{St: st, Open: true}
+	rows := wd.Render(80, 0, DefaultGlyphs())
+	want := []string{
+		"  Tasks 3 (1 done, 1 in progress, 1 open) · /tasks",
+		"  ◼ first",
+		"  ◻ second",
+		"  ✓ third",
+	}
+	if len(rows) != len(want) {
+		t.Fatalf("panel rendered %d rows, want %d:\n%s", len(rows), len(want), plain(rows))
+	}
+	for i, w := range want {
+		if rows[i].Text() != w {
+			t.Errorf("row %d = %q, want %q", i, rows[i].Text(), w)
+		}
+	}
+}
+
+// TestTasksWidgetPanelCountsWhatDoesNotFit is the bounded panel's honesty: six rows
+// are the most it spends on itself, and the last one is spent on the count of what
+// did not fit. Five tasks fit whole; eight leave three unshown.
+func TestTasksWidgetPanelCountsWhatDoesNotFit(t *testing.T) {
+	build := func(n int) *state.State {
+		st := &state.State{}
+		for i := 0; i < n; i++ {
+			st.Tasks = append(st.Tasks, &state.Task{Title: "task", Status: event.TaskPending})
+		}
+		return st
+	}
+	g := DefaultGlyphs()
+	rows := (TasksWidget{St: build(5), Open: true}).Render(80, 0, g)
+	if len(rows) != 6 || strings.Contains(plain(rows), "… +") {
+		t.Fatalf("five tasks rendered %d rows, want header plus five and no count:\n%s", len(rows), plain(rows))
+	}
+	rows = (TasksWidget{St: build(8), Open: true}).Render(80, 0, g)
+	if len(rows) != 7 {
+		t.Fatalf("eight tasks rendered %d rows, want header plus five plus the count:\n%s", len(rows), plain(rows))
+	}
+	if last := rows[len(rows)-1].Text(); last != "  … +3" {
+		t.Errorf("the overflow row is %q, want %q", last, "  … +3")
+	}
+}
+
+// TestTasksWidgetPanelYieldsToShortScreens keeps the panel a neighbour of the
+// conversation rather than its replacement: a screen that cannot hold the full
+// panel shows fewer tasks, and one that cannot hold the panel at all keeps only
+// the summary, which is the row that says there is something to open.
+func TestTasksWidgetPanelYieldsToShortScreens(t *testing.T) {
+	st := &state.State{}
+	for i := 0; i < 8; i++ {
+		st.Tasks = append(st.Tasks, &state.Task{Title: "task", Status: event.TaskPending})
+	}
+	wd := TasksWidget{St: st, Open: true}
+	if rows := wd.Render(80, 5, DefaultGlyphs()); len(rows) > 5 {
+		t.Errorf("a five-row screen was handed %d rows:\n%s", len(rows), plain(rows))
+	}
+	for _, h := range []int{1, 2} {
+		rows := wd.Render(80, h, DefaultGlyphs())
+		if len(rows) != 1 || !strings.HasPrefix(rows[0].Text(), "  Tasks") {
+			t.Errorf("height %d rendered %d rows, want only the summary:\n%s", h, len(rows), plain(rows))
+		}
+	}
+	if rows := wd.Render(80, 0, DefaultGlyphs()); len(rows) != 7 {
+		t.Errorf("an unbounded surface rendered %d rows, want the full panel:\n%s", len(rows), plain(rows))
+	}
+}
+
+// TestTasksWidgetPanelFitsAnyWidth runs the open panel down the widths and refuses
+// a row wider than it was given or ending in a bare space, either of which is how a
+// terminal is talked into wrapping a row the frame owns.
+func TestTasksWidgetPanelFitsAnyWidth(t *testing.T) {
+	st := &state.State{Tasks: []*state.Task{
+		{Title: "a task with a reasonably long title to wrap", Status: event.TaskActive},
+		{Title: "another", Status: event.TaskPending},
+	}}
+	for w := 1; w <= 40; w++ {
+		rows := (TasksWidget{St: st, Open: true}).Render(w, 0, DefaultGlyphs())
+		for i, row := range rows {
+			if row.Width() > w {
+				t.Errorf("width %d row %d is %d columns: %q", w, i, row.Width(), row.Text())
+			}
+			if endsInBareSpace(row) {
+				t.Errorf("width %d row %d ends in a space: %q", w, i, row.Text())
+			}
+		}
+	}
+}
+
+// TestStatusQuietHandsWorkingToTheBorder is the move of the working verb to the
+// input's top border, seen from the row it left. Quiet empties the working rung and
+// nothing else: the metadata the row carried keeps its place without a dangling
+// separator, the other rungs of the ladder draw exactly as before, and the widget
+// still asks for its ticks, because the spinner that now lives in the border turns
+// on the same wake-up this row has always armed.
+func TestStatusQuietHandsWorkingToTheBorder(t *testing.T) {
+	g := DefaultGlyphs()
+	wd := StatusWidget{St: statusStates()["working"], Phase: 2, Quiet: true}
+	rows := wd.Render(80, 0, g)
+	text := plain(rows)
+	if strings.Contains(text, "working") {
+		t.Errorf("a quiet row still says working: %q", text)
+	}
+	for _, want := range []string{"builder", "$0.08 of $0.50", "turn 3", "12.4k in", "3.1k out"} {
+		if !strings.Contains(text, want) {
+			t.Errorf("a quiet row lost %q: %q", want, text)
+		}
+	}
+	if !strings.HasPrefix(text, " builder") {
+		t.Errorf("the row opens on %q, want the metadata with no leading separator", text)
+	}
+	if !wd.Animated() {
+		t.Error("a quiet working row stopped asking for the ticks the border spinner turns on")
+	}
+	// The other rungs are untouched by the move.
+	for name, verb := range map[string]string{
+		"waiting": "waiting", "blocked": "blocked on budget_raise", "done": "done", "idle": "idle",
+	} {
+		row := (StatusWidget{St: statusStates()[name], Quiet: true}).Render(80, 0, g)[0].Text()
+		if !strings.Contains(unmargin(t, row), verb) {
+			t.Errorf("%s: a quiet row draws %q, want it to keep the verb", name, row)
+		}
+	}
+	// And nothing at all beats a lone verb: a working state with no metadata to show
+	// gives its row up entirely rather than drawing one blank line.
+	bare := &state.State{Active: true}
+	if rows := (StatusWidget{St: bare, Quiet: true}).Render(80, 0, g); rows != nil {
+		t.Errorf("a quiet row with nothing to say drew %q", plain(rows))
 	}
 }
 

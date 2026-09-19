@@ -1,0 +1,5 @@
+┌ Deploy 日本 ─────────┐
+│Latency is above the  │
+│preferred threshold   │
+│Press r to retry      │
+┌ ↑↓ scroll ───────────┘

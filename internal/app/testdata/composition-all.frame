@@ -1,0 +1,24 @@
+╭──────────────────────────────────────────────────────────────────────────────╮
+│ ❯ /                                                                          │
+╰──────────────────────────────────────────────────────────────────────────────╯
+◆ Allow the write to go.mod?
+  y  allow
+  n  deny
+  timeout  deny
+  Thinking effort
+    low
+    medium
+  ● high  Balanced thinking for most tasks.
+    xhigh
+    max
+    ultracode
+  Balanced thinking for most tasks.
+  ↑/↓ move · Enter confirm · Esc cancel
+    /effort  Set thinking effort level  [low|medium|high|xhigh|max|ultracode|auto] 
+    /config  Edit configuration and inspect effective values 
+    /team    Show the team roster and live state 
+    /tasks   Show the task list and live status 
+    /recap   Toggle recap line after responses 
+ · end of scenario — the input bar is yours, ctrl+d to leave
+ · press ctrl+c again to leave
+ done

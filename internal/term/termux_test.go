@@ -2,10 +2,9 @@ package term
 
 import "testing"
 
-// A wrong answer here is not cosmetic in either direction, which is why so small a function
-// gets a table. Say yes to a desktop and a mouse that has a drag loses it, taking
-// drag-to-select with it. Say no to a phone and a swipe goes on walking the input's history,
-// which is the whole of the bug this exists to fix.
+// A wrong answer here changes who owns a phone's taps. Say yes to a desktop and platform
+// defaults intended for Termux leak into an SSH client. Say no to a phone and mouse tracking
+// can swallow the tap Termux needs to show Android's keyboard again.
 //
 // Every case sets all four variables, including the ones it wants empty: the function reads
 // the process environment, and a test that inherits half of it passes or fails by whose

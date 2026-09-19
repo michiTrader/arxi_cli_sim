@@ -526,3 +526,141 @@ func TestLoadOfAMissingFileIsAnError(t *testing.T) {
 		t.Fatal("a path that does not exist was accepted")
 	}
 }
+
+func TestThemePackRoleAndPerKeyLayering(t *testing.T) {
+	pack, err := config.ParseTheme("night.toml", []byte(`[glyphs]
+prompt.marker = "T "
+[styles]
+prompt.text = fg=blue
+md.code = fg=green
+[anim]
+period = 70
+width = 22
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	file, err := config.Parse("config.toml", []byte(`[glyphs]
+prompt.marker = "U "
+[styles]
+prompt.text = fg=red
+[anim]
+width = 9
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := file.WithTheme(pack)
+	if got.Glyphs["prompt.marker"] != "U " {
+		t.Fatalf("file glyph lost to theme: %q", got.Glyphs["prompt.marker"])
+	}
+	if got.Styles["prompt.text"] != (ui.Style{FG: ui.Idx(ui.Red)}) {
+		t.Fatalf("file style lost to theme: %v", got.Styles["prompt.text"])
+	}
+	if got.Styles["md.code"] != (ui.Style{FG: ui.Idx(ui.Green)}) {
+		t.Fatalf("theme did not fill missing style: %v", got.Styles["md.code"])
+	}
+	if got.Anim.Period != 70 || got.Anim.Width != 9 {
+		t.Fatalf("anim layering = %+v, want theme period and file width", got.Anim)
+	}
+	if file.Glyphs["prompt.marker"] != "U " || pack.Glyphs["prompt.marker"] != "T " {
+		t.Fatal("WithTheme mutated an input")
+	}
+}
+
+func TestThemePackRefusesBehaviourWithLineNumber(t *testing.T) {
+	_, err := config.ParseTheme("night.toml", []byte("[styles]\nprompt.text = fg=blue\n\n[keys]\nesc = cancel\n"))
+	if err == nil {
+		t.Fatal("theme accepted [keys]")
+	}
+	got := err.Error()
+	if !strings.Contains(got, "night.toml:4:") || !strings.Contains(got, "not a section a theme may hold") {
+		t.Fatalf("error = %q", got)
+	}
+}
+
+func TestLayoutParsesClosedVocabularyAndTiers(t *testing.T) {
+	f, err := config.Parse("config.toml", []byte(`[ui]
+theme = "night"
+[layout]
+above_input = "recap, tasks"
+below_input@width<60 = "approval, interrupt"
+bottom@height<12 = ""
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if f.ThemeName != "night" {
+		t.Fatalf("theme = %q", f.ThemeName)
+	}
+	want := []app.LayoutOverride{
+		{Slot: ui.SlotAboveInput, Names: []string{"recap", "tasks"}},
+		{Slot: ui.SlotBelowInput, Width: 60, Names: []string{"approval", "interrupt"}},
+		{Slot: ui.SlotBottom, Height: 12},
+	}
+	if !slices.EqualFunc(f.Layout, want, func(a, b app.LayoutOverride) bool {
+		return a.Slot == b.Slot && a.Width == b.Width && a.Height == b.Height && slices.Equal(a.Names, b.Names)
+	}) {
+		t.Fatalf("layout = %+v, want %+v", f.Layout, want)
+	}
+}
+
+func TestExtensionsParseResolveAndValidate(t *testing.T) {
+	dir := t.TempDir()
+	manifest := filepath.Join(dir, "clock", "manifest.toml")
+	if err := os.MkdirAll(filepath.Dir(manifest), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	body := `name = "clock"
+version = "1"
+protocol = "ext/v1"
+executable = "clock"
+capabilities = ["events.subscribe", "events.emit"]
+`
+	if err := os.WriteFile(manifest, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "config.toml")
+	data := []byte("[extensions.clock]\nmanifest = \"clock/manifest.toml\"\nenabled = false\nallow = [\"events.emit\", \"events.subscribe\"]\n")
+	f, err := config.Parse(path, data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	x := f.Extensions["clock"]
+	if x.Name != "clock" || x.Manifest != manifest || x.Enabled || !x.Allow.Has("events.subscribe") || !x.Allow.Has("events.emit") {
+		t.Fatalf("extension = %+v", x)
+	}
+}
+
+func TestExtensionErrorsAggregateWithConfigLines(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.toml")
+	_, err := config.Parse(path, []byte("[extensions.Bad]\nmanifest = \"missing.toml\"\n\n[extensions.clock]\nmanifest = \"missing.toml\"\nallow = [\"unknown\"]\n"))
+	if err == nil {
+		t.Fatal("Parse succeeded")
+	}
+	for _, line := range []int{1, 6} {
+		if !strings.Contains(err.Error(), fmt.Sprintf("%s:%d:", path, line)) {
+			t.Errorf("missing line %d: %v", line, err)
+		}
+	}
+}
+
+func TestLayoutErrorsNameTheirLine(t *testing.T) {
+	for _, tc := range []struct{ name, row, want string }{
+		{"unknown widget", `above_input = "made-up"`, `"made-up" is not a widget`},
+		{"wrong slot", `bottom = "tasks"`, `"tasks" is drawn in above_input and not bottom`},
+		{"unused slot", `left = ""`, `no widget asks for left`},
+		{"bad tier", `bottom@width<no = "status"`, `whole number of columns`},
+		{"duplicate name", `above_input = "tasks, tasks"`, `"tasks" is listed twice`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := config.Parse("layout.toml", []byte("[layout]\n"+tc.row+"\n"))
+			if err == nil {
+				t.Fatal("Parse succeeded")
+			}
+			if got := err.Error(); !strings.Contains(got, "layout.toml:2:") || !strings.Contains(got, tc.want) {
+				t.Fatalf("error = %q, want line and %q", got, tc.want)
+			}
+		})
+	}
+}

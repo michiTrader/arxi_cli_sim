@@ -6,18 +6,11 @@ import (
 )
 
 // IsTermux reports whether the terminal drawing this session is Termux's own view on
-// Android. It is one question with one caller, and the answer changes exactly one
-// decision: whether the program claims the mouse.
-//
-// Everywhere else the mouse is left to the terminal, because a pointer that drags is how a
-// reader selects text and the wheel has keyboard spellings that cost nothing to learn. On a
-// phone neither half of that holds. A finger has no drag to protect — Termux selects with a
-// long press and the handles it draws, and it asks the program's permission for neither — and
-// a swipe with the mouse released is not a wheel that does nothing, it is the input's history
-// being walked: Termux scrolls the alternate buffer by synthesizing the arrow keys, byte for
-// byte the ones a reader would have pressed, so nothing downstream can tell a swipe from a
-// press of up. DECSET 1007 is the switch that stops exactly this on a desktop, and Termux
-// never consults it. Claiming tracking is the only fix there is, and it is free.
+// Android. Its answer sets two phone defaults, and they are one trade. The conversation is
+// drawn on the main screen, where a swipe is Termux's own scrollback moving the transcript
+// instead of the shell's history; and the mouse is left to the terminal, because tracking
+// turns the tap that shows Android's keyboard back into a mouse report, and no sequence asks
+// for the keyboard after that. Flags and the config file can still choose either differently.
 //
 // TERMUX_VERSION is the app's own signal, exported by the process that draws the view. PREFIX
 // under com.termux is the bootstrap's path, which nothing else has a reason to name, and it is

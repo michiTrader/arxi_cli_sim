@@ -599,7 +599,7 @@ func TestDefaultBindingsAreCanonicalAndReachable(t *testing.T) {
 		}
 	}
 	for _, d := range ActionKeys {
-		if !bound[d.Action] {
+		if !bound[d.Action] && !slashReachable[d.Action] {
 			t.Errorf("action %q is declared and no default key reaches it", d.Action)
 		}
 	}
@@ -1972,10 +1972,9 @@ func TestTheBandsShapeIsTheConfigsAndTheClockIsOurs(t *testing.T) {
 	if got := statusBand(t, a); got != want {
 		t.Errorf("the status band is %+v, want %+v", got, want)
 	}
-	// The box's band is the same shape at half the rate: Slower doubles the rest between passes
-	// and touches neither the pass nor the width, so the light crosses the box at exactly the
-	// speed it crosses the verb and simply comes round half as often. That is the one place the
-	// two bands differ and it is one multiplication, at the call, where a reader can find it.
+	// The box's band keeps the same pass and multiplies only its established dark rest.
+	// Slower(2) creates that established cadence; LongerRest(4) then leaves Travel and Width
+	// untouched while making its already-slowed rest four times as long.
 	base := a.shine(ui.InputShine)
 	in := a.inputShine()
 	if in.Style != ui.InputShine {
@@ -1988,9 +1987,11 @@ func TestTheBandsShapeIsTheConfigsAndTheClockIsOurs(t *testing.T) {
 		t.Errorf("the box's pass is %d ticks over %d columns, want the verb's %d over %d",
 			in.Travel, in.Width, base.Travel, base.Width)
 	}
-	if in.Period != 2*base.Period {
-		t.Errorf("the box waits %d ticks between passes, want twice the verb's %d",
-			in.Period, base.Period)
+	slowedRest := 2*base.Period - base.Travel
+	wantPeriod := base.Travel + 4*slowedRest
+	if in.Period != wantPeriod {
+		t.Errorf("the box period is %d ticks, want %d (%d visible + four times %d dark)",
+			in.Period, wantPeriod, base.Travel, slowedRest)
 	}
 	// And a config that never asked for light gets none, which is the zero value doing the
 	// switching: this is the state every golden file and both corpus sweeps render in.
@@ -2506,5 +2507,88 @@ func TestASurfaceWithNoColumnBesideItHasNoBarToPress(t *testing.T) {
 				}
 			}
 		}
+	}
+}
+
+// TestScrollbackLeavesTheSwipeAsTheOnlyScroll holds the app half of the phone's surface: the
+// keys that move the reading position answer no there, because the position is the
+// terminal's own history and the terminal takes no requests. The keymap does not fork — the
+// keys stay bound and the surface is what says no — which keeps one table serving every run,
+// the invariant the Termux arrangement was built inside. The same keys on any other surface
+// still move, which is what keeps this a surface rule and not a change of mind about keys.
+func TestScrollbackLeavesTheSwipeAsTheOnlyScroll(t *testing.T) {
+	a := New(Config{
+		Out:     &bytes.Buffer{},
+		Emitter: &ui.Emitter{Theme: ui.DefaultTheme(), Mode: ui.ModeInline, Profile: ui.ProfileMono, Scrollback: true},
+		Width:   80,
+		Height:  24,
+	})
+	if err := a.draw(); err != nil {
+		t.Fatal(err)
+	}
+	before := a.top
+	for _, name := range []string{"ctrl+up", "ctrl+down", "pgup", "pgdown", "shift+up", "shift+down"} {
+		if a.key(mustKey(t, name)) {
+			t.Errorf("%s asked for a frame on a scrollback surface", name)
+		}
+	}
+	if a.top != before || a.scrolled {
+		t.Fatalf("the movers moved the view anyway: top %d, scrolled %v", a.top, a.scrolled)
+	}
+
+	// The same keys on any other surface still move, which is what keeps this a surface
+	// rule and not a change of mind about the keys. The conversation has to be taller
+	// than the window first: ctrl+up from a top at row zero has nowhere to go anywhere.
+	b, _ := scrollableSize(t, linesChanged, ui.ModeAlt, 0, 80, 24)
+	if !b.key(mustKey(t, "ctrl+up")) {
+		t.Fatal("ctrl+up asked for no frame on an ordinary surface")
+	}
+	if !b.scrolled {
+		t.Fatal("ctrl+up did not move the reading position")
+	}
+}
+
+// TestScrollbackLaysTheWindowBackDownAfterAVisitor holds the seam. A roster, a config
+// editor or a consent paints the screen with rows that are not the transcript; the next
+// conversation draw answers with one seam frame — the window parked at the row history ends
+// on, painted over the visitor — before the real frame, because a scroll carries whatever
+// the screen's top is holding and after a visit that is not the transcript. Two paints in
+// the return draw and one in any other is the whole of the contract.
+func TestScrollbackLaysTheWindowBackDownAfterAVisitor(t *testing.T) {
+	var out bytes.Buffer
+	a := New(Config{
+		Out:     &out,
+		Emitter: &ui.Emitter{Theme: ui.DefaultTheme(), Mode: ui.ModeInline, Profile: ui.ProfileMono, Scrollback: true},
+		Width:   80,
+		Height:  24,
+	})
+	if err := a.draw(); err != nil {
+		t.Fatal(err)
+	}
+	out.Reset()
+
+	a.openTeam()
+	if err := a.draw(); err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Count(out.String(), "\x1b[?2026h"); got != 1 {
+		t.Fatalf("a visitor's draw painted %d frames, want 1", got)
+	}
+	out.Reset()
+
+	a.closeFullView()
+	if err := a.draw(); err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Count(out.String(), "\x1b[?2026h"); got != 2 {
+		t.Fatalf("the return draw painted %d frames, want the seam and the window (2)", got)
+	}
+	out.Reset()
+
+	if err := a.draw(); err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Count(out.String(), "\x1b[?2026h"); got != 1 {
+		t.Fatalf("a settled draw painted %d frames, want 1", got)
 	}
 }

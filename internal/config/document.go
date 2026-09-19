@@ -9,8 +9,11 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
+
+	"arxi.local/sim/internal/ext"
 )
 
 var (
@@ -187,6 +190,72 @@ func (d *Document) SetBool(section, key string, value bool) error {
 		return unsupportedSetting(section, key)
 	}
 	return d.set(section, key, strconv.FormatBool(value))
+}
+
+type ManagedExtension struct {
+	Manifest      string
+	Enabled       bool
+	PackageDigest string
+	Generation    int
+}
+
+// RegisterExtension appends a new managed extension without rewriting existing bytes.
+// It refuses any existing section of the same name rather than updating it implicitly.
+func (d *Document) RegisterExtension(name string, value ManagedExtension) error {
+	if !validExtensionName(name) || value.Manifest == "" || value.Generation < 0 {
+		return &ValidationError{Path: d.path, Err: errors.New("invalid managed extension metadata")}
+	}
+	section := "extensions." + name
+	if line, _, _ := d.locate(section, "manifest"); line >= 0 {
+		return &ValidationError{Path: d.path, Err: fmt.Errorf("extension %q is already configured", name)}
+	}
+	if err := d.set(section, "manifest", quoteString(value.Manifest)); err != nil {
+		return err
+	}
+	if err := d.set(section, "enabled", strconv.FormatBool(value.Enabled)); err != nil {
+		return err
+	}
+	if err := d.set(section, "allow", "[]"); err != nil {
+		return err
+	}
+	if err := d.set(section, "identity", quoteString("")); err != nil {
+		return err
+	}
+	if err := d.set(section, "package_digest", quoteString(value.PackageDigest)); err != nil {
+		return err
+	}
+	return d.set(section, "generation", strconv.Itoa(value.Generation))
+}
+
+// SetExtensionConsent persists the exact grants and manifest identity together.
+func (d *Document) SetExtensionConsent(name string, allow ext.CapabilitySet, identity string) error {
+	if identity == "" {
+		return &ValidationError{Path: d.path, Err: errors.New("extension identity must not be empty")}
+	}
+	if err := d.SetExtensionAllow(name, allow); err != nil {
+		return err
+	}
+	return d.set("extensions."+name, "identity", quoteString(identity))
+}
+
+// SetExtensionAllow persists the exact consent set for one configured extension.
+func (d *Document) SetExtensionAllow(name string, allow ext.CapabilitySet) error {
+	if !validExtensionName(name) {
+		return &ValidationError{Path: d.path, Err: fmt.Errorf("invalid extension name %q", name)}
+	}
+	values := make([]string, 0, len(allow))
+	for capability := range allow {
+		if !ext.KnownCapabilityFor("ext/v2", capability) {
+			return &ValidationError{Path: d.path, Err: fmt.Errorf("unknown capability %q", capability)}
+		}
+		values = append(values, string(capability))
+	}
+	sort.Strings(values)
+	encoded := make([]string, len(values))
+	for i, value := range values {
+		encoded[i] = quoteString(value)
+	}
+	return d.set("extensions."+name, "allow", "["+strings.Join(encoded, ", ")+"]")
 }
 
 // SetPositiveInt changes one supported persistent positive integer setting.

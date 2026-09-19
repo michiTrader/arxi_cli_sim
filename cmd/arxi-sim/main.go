@@ -12,14 +12,20 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sort"
+	"strconv"
 	"strings"
 	"syscall"
 
 	"arxi.local/sim/internal/app"
 	"arxi.local/sim/internal/config"
+	"arxi.local/sim/internal/ext"
+	"arxi.local/sim/internal/ext/install"
+	"arxi.local/sim/internal/ext/orchestrator"
 	"arxi.local/sim/internal/scenario"
 	"arxi.local/sim/internal/term"
 	"arxi.local/sim/internal/ui"
@@ -31,6 +37,12 @@ usage:
   arxi-sim play [flags] <scenario.ndjson>
   arxi-sim keys
   arxi-sim check <scenario.ndjson|config.toml>...
+  arxi-sim extensions list [--config <config.toml>]
+  arxi-sim extensions install <directory> [--yes] [--config <config.toml>]
+
+extensions list reads configuration without starting extension processes. install
+preflights and copies an immutable local package, then registers it enabled but
+with no runtime capability grants; the first run asks for consent.
 
 play flags, which go before the file because flag parsing stops at the first
 argument that is not one:
@@ -38,9 +50,11 @@ argument that is not one:
   -instant    fold the whole log and print the last frame as text, no waiting
   -inline     draw under the shell prompt instead of on the alternate screen;
               scroll and resize are the terminal's problem, and a terminal that
-              reflows will garble the conversation when the window is dragged
-  -alt        take the alternate screen; this is the default, and the flag is
-              still accepted so an old command line keeps working
+              reflows will garble the conversation when the window is dragged.
+              On Termux it also streams the conversation into the terminal's
+              own history as it goes: see On Android below
+  -alt        take the alternate screen, which is the default everywhere. The
+              flag is accepted so an old command line keeps working
   -ascii      no box drawing and no emoji: the fallback glyph for everything
   -no-color   emit no colour, whatever the terminal claims it can take
   -width n    columns for -instant (default 80); ignored when playing
@@ -51,7 +65,9 @@ argument that is not one:
               send it a wheel notch: the wheel then scrolls the conversation and
               selecting text needs shift held down. On by default, because a
               wheel that does nothing reads as a broken program; -mouse=false
-              gives the mouse back to the terminal and a plain drag selects again
+              gives the mouse back to the terminal and a plain drag selects
+              again. Off by default on Termux, where the claim would take the
+              tap that reopens the keyboard; see On Android below
   -shine      sweep a highlight along the input while it is your turn, and along
               the word "working" while it is not. On by default; -shine=false
               stops it, and so does [anim] shine = false
@@ -59,19 +75,31 @@ argument that is not one:
               default, which draws an unbroken rule
   -config p   read settings from p instead of the file in the default place;
               -config "" reads none at all
+  -theme s    wear the theme pack named s, from the themes dir beside the
+              config file; -theme "" wears none, whatever [ui] says. A pack
+              carries taste only — [glyphs], [styles] and [anim] — and layers
+              under your own file: per key, what your config says wins and the
+              pack fills in the rest, so partial packs are legal. A pack that
+              is missing or broken is an error and never a silent return to
+              the shipped look
 
 An interactive run takes the alternate screen, which is the surface a resize
 cannot corrupt: no terminal reflows it, so a drag is one repaint at the new
 width. It is printed onto the main screen in one piece when the session ends —
 nothing reaches your history before then, and nothing of your own is erased.
+Termux runs the same surface, with the mouse left to the terminal so a tap
+still reaches the keyboard. See On Android below.
 
 The keys are the ones a hand already knows. Enter sends the line and ctrl+enter
 starts a second one inside the input; shift+enter does the same on a terminal
 that can tell the two chords apart. Plain up and down are the input's history, as
-in a shell, and the conversation moves under the keyboard: ctrl+up/down by three
+in a shell — on a phone with the mouse released they scroll the conversation
+instead, one row a report, and ctrl+p/ctrl+n keep the history — and the
+conversation moves under the keyboard: ctrl+up/down by three
 lines, alt+up/down by one, pgup/pgdown a screen, ctrl+home/ctrl+end to the ends,
 and shift+up/down jump between your own messages, which is the landmark a long
-conversation is actually searched by.
+conversation is actually searched by. They work on a phone too, where the
+extra-keys row's arrows and a released swipe both scroll; see On Android below.
 
 Leaving is ctrl+d, once, which is what EOF has always meant. ctrl+c is the line's
 key and not the door: it throws away what you were typing, the way it does in a
@@ -92,28 +120,53 @@ steadiest once the replay has caught up; and quitting leaves the whole
 conversation on the main screen, in your terminal's own scrollback, where it
 selects like any other output.
 
-On Android the same claim buys more and costs nothing. Termux selects with a long
-press and its own handles whether or not a program has the mouse, so there is no
-drag to protect; and a swipe with the mouse unclaimed does not turn a wheel that
-nothing is listening to — Termux sends the arrow keys instead, which walks the
-input's history under your finger. There a swipe reports one row at a time rather
-than in notches, so -scroll defaults to 1 and one row of swipe moves one row of
-conversation, while a real wheel notch still moves three.
+On Android the mouse is decided the other way, and the surface used to be
+with it. With tracking claimed, Termux hands a tap to the program as a mouse
+report instead of using it to show the keyboard, and no sequence can ask
+Android for the keyboard back — so a Termux run releases the mouse by default
+on either surface, and a tap is a tap. The default surface is the alternate
+screen like anywhere else, because the main screen was the phone's default
+and lost it to ctrl+o: the key re-wraps the whole transcript, rows already
+written to history cannot be re-drawn to match, and the screen stood split —
+the old level above the window, the new one below — while the rewrite also
+showed in pieces, the frame's atomicity being synchronized output (?2026),
+which Termux does not honour. The alternate screen commits nothing before
+the handover and repaints every row in place, so the same keypress draws
+clean there. What it gives up it takes back on the keys: an unclaimed swipe on
+a terminal with no 1007 arrives as the plain arrows, and while the mouse is
+released those arrows scroll the conversation, one row a report, with the
+input history kept on ctrl+p and ctrl+n. -mouse takes the swipe as a tracked
+wheel at the tap's price and hands the arrows back to the history. -inline
+still takes the main screen, where the conversation streams
+into history as it goes and the swipe is the scroll — an arrangement that
+holds while the width holds still, because turning the phone re-wraps what
+history already holds, and history is not repairable. -scroll defaults to 1
+either way, where a tracked swipe reports one row at a time rather than in
+notches.
 
-Settings live in a file where a flag would not be enough: six flat tables —
-[keys], [glyphs], [styles], [input], [scroll] and [anim] — one key = "value" a
-line, renaming a binding, redrawing a marker, recolouring a span or setting a
-number. It is read from ~/.config/arxi-sim/config.toml, or
-%AppData%\arxi-sim\config.toml on Windows, and not having one is the ordinary
-case rather than an error. A flag you type beats the file and the file beats the
-shipped default, so nothing you asked for on the command line is quietly
-overridden by something you wrote last month.
+Settings live in a file where a flag would not be enough: eight flat tables —
+[keys], [glyphs], [styles], [input], [scroll], [anim], [ui] and [layout] — one
+key = "value" a line, renaming a binding, redrawing a marker, recolouring a
+span, setting a number, naming a theme pack or reordering the chrome. It is
+read from ~/.config/arxi-sim/config.toml, or %AppData%\arxi-sim\config.toml on
+Windows, and not having one is the ordinary case rather than an error. A flag
+you type beats the file and the file beats the shipped default, so nothing you
+asked for on the command line is quietly overridden by something you wrote
+last month.
+
+Theme packs live in the themes dir beside the config file — the same portable
+path, one level down — and a pack is named by its file's name without .toml.
+[layout] rewrites the chrome per slot: above_input = "tasks, recap" orders
+those rows above the input, "" leaves a slot empty, and slot@width<60 tiers a
+row to narrow terminals. Both vocabularies — widget names and the slots they
+ask for — print under the keys command.
 
 keys prints the whole vocabulary such a file may name: bindings, actions,
-glyphs, style keys and widget slots. check loads and validates without playing,
-a recording or a config — for a config it prints how much of each table it read,
-which is the cheapest answer to whether the file the program found is the file
-you have been editing.
+glyphs, style keys, widget slots and the widget names a [layout] row may list.
+check loads and validates without playing, a recording or a config — and a
+theme pack, which is a config wearing a role. For a config it prints how much
+of each table it read, and if the config names a theme, that pack is resolved
+and validated with it, so one check reports both files.
 
 When stdin is not a terminal there is nobody to press a key, so the log is
 folded and printed exactly as -instant would.
@@ -140,11 +193,208 @@ func run(args []string) error {
 		return keys()
 	case "check":
 		return check(args[1:])
+	case "extensions":
+		return extensionsCommand(args[1:], commandIO{in: os.Stdin, out: os.Stdout, err: os.Stderr})
 	case "help", "-h", "--help":
 		fmt.Print(usage)
 		return nil
 	}
 	return fmt.Errorf("unknown command %q; try `arxi-sim help`", args[0])
+}
+
+type commandIO struct {
+	in                    io.Reader
+	out, err              io.Writer
+	configPath, storeRoot string
+}
+
+func extensionsCommand(args []string, streams commandIO) error {
+	if len(args) == 0 {
+		return errors.New("extensions takes list or install")
+	}
+	switch args[0] {
+	case "list":
+		return extensionsList(args[1:], streams)
+	case "install":
+		return extensionsInstall(args[1:], streams)
+	default:
+		return fmt.Errorf("unknown extensions command %q; want list or install", args[0])
+	}
+}
+
+func extensionFlags(command string, args []string) (*flag.FlagSet, string, bool, error) {
+	fs := flag.NewFlagSet("extensions "+command, flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	var path string
+	var yes bool
+	fs.StringVar(&path, "config", "", "config file")
+	fs.BoolVar(&yes, "yes", false, "trust and install without prompting")
+	if command == "list" {
+		fs.BoolVar(&yes, "unused-yes", false, "")
+	}
+	// Permit the conventional `install directory --yes` spelling while retaining flag's parser.
+	ordered := append([]string(nil), args...)
+	if command == "install" && len(args) > 1 && !strings.HasPrefix(args[0], "-") {
+		ordered = append(append([]string(nil), args[1:]...), args[0])
+	}
+	if err := fs.Parse(ordered); err != nil {
+		return nil, "", false, err
+	}
+	return fs, path, yes, nil
+}
+
+func commandConfigPath(streams commandIO, explicit string, given bool) string {
+	if given {
+		return explicit
+	}
+	if streams.configPath != "" {
+		return streams.configPath
+	}
+	return config.DefaultPath()
+}
+
+func extensionsList(args []string, streams commandIO) error {
+	fs, path, _, err := extensionFlags("list", args)
+	if err != nil {
+		return err
+	}
+	if fs.NArg() != 0 {
+		return errors.New("extensions list takes no arguments")
+	}
+	path = commandConfigPath(streams, path, given(fs, "config"))
+	if path == "" {
+		fmt.Fprintln(streams.out, "No config file; no extensions configured.")
+		return nil
+	}
+	f, err := config.LoadForListing(path)
+	if errors.Is(err, os.ErrNotExist) {
+		fmt.Fprintf(streams.out, "No config file at %s; no extensions configured.\n", path)
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if len(f.Extensions) == 0 {
+		fmt.Fprintf(streams.out, "No extensions configured in %s.\n", path)
+		return nil
+	}
+	names := make([]string, 0, len(f.Extensions))
+	for name := range f.Extensions {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	fmt.Fprintln(streams.out, "NAME\tVERSION\tPROTOCOL\tSTATE\tCAPABILITIES\tMANAGEMENT\tMANIFEST")
+	for _, name := range names {
+		x := f.Extensions[name]
+		manifest, loadErr := ext.LoadManifest(x.Manifest)
+		state, version, protocol, caps := "invalid", "-", "-", "-"
+		if loadErr == nil && manifest.Name == name {
+			version, protocol = manifest.Version, manifest.Protocol
+			capNames := make([]string, len(manifest.Capabilities))
+			for i, capability := range manifest.Capabilities {
+				capNames[i] = string(capability)
+			}
+			sort.Strings(capNames)
+			caps = strings.Join(capNames, ",")
+			state = extensionState(x, manifest)
+		}
+		managed := "unmanaged"
+		if x.PackageDigest != "" {
+			managed = "managed"
+		}
+		fmt.Fprintf(streams.out, "%s\t%s\t%s\t%s\t%s\t%s\t%s\n", name, version, protocol, state, caps, managed, x.Manifest)
+	}
+	return nil
+}
+
+func extensionState(x config.Extension, manifest ext.Manifest) string {
+	if !x.Enabled {
+		return "disabled"
+	}
+	packageDigest := ""
+	if x.PackageDigest != "" {
+		var err error
+		packageDigest, err = ext.TreeDigest(filepath.Dir(x.Manifest))
+		if err != nil || packageDigest != x.PackageDigest {
+			return "content-changed"
+		}
+	}
+	declared := ext.NewCapabilitySet(manifest.Capabilities...)
+	if x.Identity != ext.Identity(manifest, packageDigest) || !x.Allow.Equal(declared) {
+		return "consent-required"
+	}
+	return "ready"
+}
+
+func extensionsInstall(args []string, streams commandIO) (err error) {
+	fs, path, yes, err := extensionFlags("install", args)
+	if err != nil {
+		return err
+	}
+	if fs.NArg() != 1 {
+		return errors.New("extensions install takes exactly one directory")
+	}
+	root := streams.storeRoot
+	planOptions := []install.Options(nil)
+	if root != "" {
+		planOptions = append(planOptions, install.Options{Root: root})
+	}
+	plan, err := install.Preflight(fs.Arg(0), planOptions...)
+	if err != nil {
+		return err
+	}
+	m := plan.Manifest()
+	caps := make([]string, len(m.Capabilities))
+	for i, c := range m.Capabilities {
+		caps[i] = string(c)
+	}
+	sort.Strings(caps)
+	fmt.Fprintf(streams.out, "Source: %s\nDestination: %s\nDigest: %s\nName: %s\nVersion: %s\nProtocol: %s\nExecutable: %s\nCapabilities: %s\n", plan.Source(), plan.Destination(), plan.Digest(), m.Name, m.Version, m.Protocol, m.Executable, strings.Join(caps, ", "))
+	fmt.Fprintln(streams.err, "WARNING: This installs native code running as your user. There is NO filesystem or network sandbox. Install only code you trust.")
+	if !yes {
+		fmt.Fprint(streams.out, "Install this extension? [y/N] ")
+		var answer string
+		if _, scanErr := fmt.Fscanln(streams.in, &answer); scanErr != nil || (strings.ToLower(strings.TrimSpace(answer)) != "y" && strings.ToLower(strings.TrimSpace(answer)) != "yes") {
+			fmt.Fprintln(streams.out, "Installation declined.")
+			return nil
+		}
+	}
+	path = commandConfigPath(streams, path, given(fs, "config"))
+	if path == "" {
+		return errors.New("no user config path is available")
+	}
+	if existing, loadErr := config.LoadForListing(path); loadErr == nil {
+		if _, collision := existing.Extensions[m.Name]; collision {
+			return fmt.Errorf("extension %q is already configured", m.Name)
+		}
+	} else if !errors.Is(loadErr, os.ErrNotExist) {
+		return loadErr
+	}
+	result, err := install.Commit(plan)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if err != nil {
+			err = errors.Join(err, install.Rollback(result))
+		}
+	}()
+	doc, err := config.LoadDocument(path)
+	if err != nil {
+		return err
+	}
+	manifestPath := result.ManifestPath
+	if rel, relErr := filepath.Rel(filepath.Dir(path), manifestPath); relErr == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		manifestPath = rel
+	}
+	if err = doc.RegisterExtension(m.Name, config.ManagedExtension{Manifest: manifestPath, Enabled: true, PackageDigest: plan.Digest(), Generation: 1}); err != nil {
+		return err
+	}
+	if err = doc.Save(); err != nil {
+		return err
+	}
+	fmt.Fprintf(streams.out, "Installed %s %s. Runtime capabilities remain ungranted until first-run consent.\n", m.Name, m.Version)
+	return nil
 }
 
 // options are the flags play takes, in one place so that the two paths out of play — a
@@ -165,7 +415,9 @@ type options struct {
 	scroll  int
 	title   string
 	config  string
+	theme   string
 	anim    ui.Shimmer
+	layout  []app.LayoutOverride
 }
 
 // band is the light the player sweeps, or the zero shimmer — no light anywhere — when the
@@ -191,21 +443,20 @@ func play(args []string) error {
 	fs.Float64Var(&o.speed, "speed", 1, "divide every recorded delay by this")
 	fs.BoolVar(&o.instant, "instant", false, "fold the log and print the last frame")
 	fs.BoolVar(&o.inline, "inline", false, "draw under the shell prompt instead of on the alternate screen")
-	// -alt is parsed and thrown away. It used to be how you asked for the alternate
-	// screen; that is now what an interactive run does, so the flag has nothing left to
-	// turn on — but a command line that still names it has to run rather than die on an
-	// unknown flag, and dropping it would break every script and shell history that has it.
-	_ = fs.Bool("alt", false, "take the alternate screen; the default, and now a no-op")
+	// -alt used to be how you asked for the alternate screen; then interactive runs took it
+	// everywhere and the flag became a no-op kept alive because dropping it would break every
+	// script and shell history that names it. Termux gave it work again on 2026-09 — there
+	// the default went to the main screen and -alt was the way back — and on 2026-09-12 it
+	// became a no-op a second time, because the main screen tore at ctrl+o. inlineFor below
+	// is the rule; the reversal and its reasons are in docs/PLAN.md.
+	_ = fs.Bool("alt", false, "take the alternate screen; it is the default everywhere and the flag survives for old command lines")
 	fs.BoolVar(&o.ascii, "ascii", false, "fallback glyphs only")
 	fs.BoolVar(&o.noColor, "no-color", false, "emit no colour")
-	// On by default, and this is the third time this trade has been decided. The wheel and a
-	// plain unmodified drag cannot both work on the alternate screen: a terminal sends a notch
-	// only to a program holding the mouse, and that same claim takes the drag. It was claimed,
-	// then released to buy the drag, and released is what a reader read as a broken program —
-	// a dead wheel gives no reason for being dead, while shift+drag is a habit every editor
-	// and pager already taught. So the wheel wins by default and this flag is how to run it
-	// back. A flag and a setting both, unlike -ascii: which gesture matters more is a taste,
-	// and [scroll] mouse = false is how a reader makes that taste stick.
+	// On by default on a desktop, where a dead wheel gives no clue why it is dead and
+	// shift+drag is a habit every editor and pager already taught. A phone answers no on
+	// every surface — mouseFor below holds the rule, and the reason — because tracking
+	// takes the tap Android needs to show its keyboard again. An explicit flag or [scroll]
+	// setting wins on either platform.
 	fs.BoolVar(&o.mouse, "mouse", true, "claim the mouse so the wheel scrolls; selecting text then needs shift")
 	// The shine, on by default so that it is seen at all — an animation nobody switches on is
 	// an animation nobody reviews. It is the cheapest proof that the render seam is real: two
@@ -224,6 +475,10 @@ func play(args []string) error {
 	// escape hatch that reads nothing, for the reader whose own file is what they are
 	// debugging and who needs to see the program without it.
 	fs.StringVar(&o.config, "config", "", "read settings from this file instead of the default one")
+	// The theme pack for this run. Like -config, an empty string is a value and not the
+	// absence of one: -theme "" wears none, and is how a reader sees the shipped look
+	// without editing the file that names a pack.
+	fs.StringVar(&o.theme, "theme", "", "wear this theme pack from the themes dir")
 	fs.Usage = func() { fmt.Fprint(os.Stderr, usage) }
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -249,18 +504,52 @@ func play(args []string) error {
 	if !given(fs, "scroll") {
 		o.scroll = f.ScrollLines
 	}
-	// The two booleans a file may also hold. They are pointers there and not bools, because a
-	// file that says nothing has to be told apart from a file that says false: a plain bool
-	// would let every unconfigured run overwrite a default of true with the zero value.
-	if !given(fs, "mouse") && f.Mouse != nil {
-		o.mouse = *f.Mouse
-	}
+	// The platform layers two defaults under the flags and the file, and on a phone they are
+	// one trade. With tracking claimed, a tap arrives as a mouse report instead of reaching
+	// Termux, and Android's keyboard becomes unreachable — no escape sequence asks for it
+	// back. The surface is not the platform's to choose any more. The main screen was the
+	// phone default and lost it to ctrl+o, which re-wraps the whole transcript: rows already
+	// committed to history kept the level they were drawn at, the screen stood split above
+	// and below the window, and the un-atomic repaint — Termux honours no synchronized
+	// output — tore while it happened. The alternate screen commits nothing and repaints in
+	// place, so it draws clean, and the swipe it gives up arrives as the plain arrows —
+	// which platformKeys below then gives to the scroll. These four defaults — surface,
+	// mouse, arrows, notch — only hold as a set; "The phone arrangement" in docs/PLAN.md is
+	// the checklist, and TestTheTermuxArrangement is the tripwire.
+	isTermux := term.IsTermux()
+	o.inline = inlineFor(fs, o.inline)
+	o.mouse = mouseFor(fs, o.mouse, f.Mouse, isTermux)
 	if !given(fs, "shine") && f.Shine != nil {
 		o.shine = *f.Shine
 	}
-	// The shine's numbers, straight from [anim]. A zero in any of them is "unset" and the
-	// shimmer fills it with its own default, so there is nothing to check here.
+	// The theme ladder, spec/look.md's: a flag beats [ui] beats wearing none. -theme ""
+	// typed is the second answer and not the first — given() tells them apart, which is
+	// why the field alone cannot. A named pack that is missing or broken stops the run
+	// here rather than dressing the program in whatever it did not ask for. The dressed
+	// file is what the rest of play reads: its [anim], its [layout], its glyph and style
+	// tables all answer with the pack's word where the file was silent.
+	themeName := f.ThemeName
+	if given(fs, "theme") {
+		themeName = o.theme
+	}
+	var pack *config.File
+	// raw is the file as it was written, before the pack layered under it. The
+	// controller edits and saves that file, so it reads raw and is handed the pack
+	// only to attribute what the file was silent about.
+	raw := f
+	if themeName != "" {
+		pack, err = config.LoadTheme(themeName)
+		if err != nil {
+			return err
+		}
+		f = f.WithTheme(pack)
+	}
+	// The shine's numbers and the chrome's layout, straight from the dressed file. A zero
+	// in a shimmer field is "unset" and the shimmer fills it with its own default, so
+	// there is nothing to check here. The layout has no flag: a composition is a thing
+	// you write down and keep, not a thing you type per run.
 	o.anim = f.Anim
+	o.layout = f.Layout
 
 	sc, err := load(fs.Arg(0))
 	if err != nil {
@@ -278,18 +567,26 @@ func play(args []string) error {
 	if err != nil {
 		return err
 	}
-	km, err := f.Keymap()
+	km, err := keymapFor(f, isTermux, o.mouse)
 	if err != nil {
 		return err
 	}
-	// The surface, decided here and nowhere else. An interactive run takes the alternate
-	// screen, because that is the only surface a resize cannot corrupt: a terminal reflows
-	// the rows it has on the main screen and pushes whatever no longer fits above the top
-	// edge into scrollback, where no erase of ours can reach it, and a slow drag does that
-	// once per step until the conversation is shredded. Nothing reflows the alternate
-	// buffer, so a drag there is one repaint at the new width. -inline keeps the old
-	// surface for whoever wants the run under their prompt and can live with that.
-	em := &ui.Emitter{Theme: theme, Mode: ui.ModeAlt, Profile: ui.ProfileMono, Mouse: o.mouse}
+	// What a run buys with the alternate screen is the surface a resize cannot shred: a
+	// terminal reflows the rows it has on the main screen and pushes whatever no longer fits
+	// above the top edge into scrollback, where no erase of ours can reach it, so a slow drag
+	// shreds the conversation one step at a time, and nothing reflows the alternate buffer.
+	// It is also why the phone runs here now: a level change re-wraps rows the main screen
+	// has already committed, and history cannot be re-drawn to match. -inline asks for that
+	// surface on purpose, knowing the price.
+	// The scrollback stream rides on it, on the phone only. On that surface the reader
+	// scrolls with a finger, the conversation is written into the terminal's history as the
+	// window leaves it behind, and the swipe is the conversation moving. It costs the
+	// in-app viewport its freedom — the window stays on the tail, because a row history
+	// holds cannot be re-shown — and it stands or falls with the width holding still,
+	// which a phone's does unless the device is turned. A desktop -inline keeps the old
+	// contract: nothing reaches history until the handover, because a dragged window
+	// re-wraps committed rows and history is not repairable.
+	em := &ui.Emitter{Theme: theme, Mode: ui.ModeAlt, Profile: ui.ProfileMono, Mouse: o.mouse, Scrollback: o.inline && isTermux}
 	if o.inline {
 		em.Mode = ui.ModeInline
 	}
@@ -306,30 +603,23 @@ func play(args []string) error {
 	if err != nil {
 		return err
 	}
-	// One terminal wants a different number, and now that there is a terminal open this is
-	// where it gets to. The mouse is claimed everywhere, so the reason Termux used to be a
-	// special case is gone — but what arrives there is still not a notch. Termux answers a
-	// finger with one report per row it has travelled, so three rows a report would scroll a
-	// swipe three times too far; 1 makes the page track the hand, and a real wheel notch is
-	// three reports there and so still moves three rows.
+	// A tracked swipe in Termux produces one report per row travelled, so when tracking was
+	// explicitly enabled one row per report keeps the page under the hand. The same default is
+	// harmless when tracking is off and documents the value that will apply if it is enabled at
+	// runtime through the config view.
 	//
 	// This is a default and not a policy. -scroll is asked for by the flag or by the file —
 	// `given` reads the flag, and a file that set it has already left a number here, since the
-	// config refuses a zero. So the order that holds everywhere else holds here too: what you
-	// typed, then the file, then this, then the shipped 3. A typed -scroll 0 or -2 is left
-	// where it lands for the same reason it is on a desktop, which is that main validates none
-	// of its numbers and this is not the place to start.
-	if term.IsTermux() && !given(fs, "scroll") && o.scroll <= 0 {
-		o.scroll = 1
-	}
-	controller, err := configControllerFor(fs, o, f)
+	// config refuses a zero.
+	o.scroll = scrollFor(fs, o.scroll, isTermux)
+	controller, err := configControllerFor(fs, o, raw, pack, themeName)
 	if err != nil {
 		return err
 	}
 	return live(tty, sc, em, &glyphs, km, controller, o)
 }
 
-func configControllerFor(fs *flag.FlagSet, o options, f *config.File) (*config.Controller, error) {
+func configControllerFor(fs *flag.FlagSet, o options, f *config.File, pack *config.File, themeName string) (*config.Controller, error) {
 	configPath := config.DefaultPath()
 	configEnabled := configPath != ""
 	if given(fs, "config") {
@@ -337,6 +627,7 @@ func configControllerFor(fs *flag.FlagSet, o options, f *config.File) (*config.C
 	}
 	return config.NewController(config.ControllerOptions{
 		Path: configPath, Enabled: configEnabled, File: f, ASCII: o.ascii,
+		ThemeName: themeName, Theme: pack,
 		Runtime: runtimeLabel(o), Title: o.title, ScrollLines: o.scroll, Mouse: o.mouse,
 		Shine: o.shine, Anim: o.anim,
 		MaskTitle: given(fs, "title"), MaskScroll: given(fs, "scroll"),
@@ -368,6 +659,92 @@ func configFor(fs *flag.FlagSet, path string) (*config.File, error) {
 	return config.Load(path)
 }
 
+// inlineFor answers "main screen?" from the flags alone. It used to end on the platform: a
+// phone took the main screen unasked, because only there does a swipe scroll the
+// conversation and a tap reach the keyboard — until ctrl+o showed what that surface costs.
+// A level change re-wraps the transcript, the rows history has taken cannot be re-drawn to
+// match, and Termux, honouring no synchronized output, displayed the rewrite in pieces; so
+// on 2026-09-12 the default went back to the alternate screen everywhere. -inline asks for
+// the main screen anywhere, -alt names the default it already is and survives only in the
+// flag set, and with neither typed no run takes the main screen.
+func inlineFor(fs *flag.FlagSet, flagValue bool) bool {
+	if given(fs, "inline") {
+		return flagValue
+	}
+	return false
+}
+
+// mouseFor layers the mouse decision the same way: what you typed, then the file, then the
+// platform. The desktop answer is the wheel — on the alternate screen a notch exists only
+// for a program holding the mouse. The phone answers no on every surface: a claimed tap is
+// a report, and a report is a keyboard that never comes back — the alternate screen is
+// where the phone first learnt that, back when claiming was its default. What a released
+// swipe costs — it arrives as the plain arrows on a terminal with no 1007 — the view keys
+// cover, and -mouse says otherwise for a phone with a mouse attached.
+func mouseFor(fs *flag.FlagSet, flagValue bool, configured *bool, termux bool) bool {
+	if given(fs, "mouse") {
+		return flagValue
+	}
+	if configured != nil {
+		return *configured
+	}
+	return !termux
+}
+
+// keymapFor builds the run's keymap the way every other setting is layered: the platform's
+// key defaults underneath, the config's [keys] table over them, the shipped table under
+// everything. The table in app stays one table for every run — what a platform adds is a
+// default here, not a fork there.
+func keymapFor(f *config.File, termux, mouse bool) (*app.Keymap, error) {
+	platform := platformKeys(termux, mouse)
+	overrides := make(map[string]app.Action, len(f.Keys)+len(platform))
+	for name, act := range f.Keys {
+		overrides[name] = act
+	}
+	for name, act := range platform {
+		if _, set := overrides[name]; !set {
+			overrides[name] = act
+		}
+	}
+	return app.NewKeymap(overrides)
+}
+
+// platformKeys answers the key defaults a platform adds, and nil where it has none. A phone
+// with the mouse released is the one that has any, and it is also the one that needs them:
+// Termux synthesizes the plain arrow keys for an unclaimed swipe on the alternate buffer and
+// implements no 1007 to switch the synthesis off, so the released swipe arrives as up and
+// down — and if those mean "history", as they do everywhere else, the conversation has no
+// scroll a finger can reach. Bound to the one-row scroll actions the swipe is the scroll
+// again, at the grain the tracked wheel had, and the history keeps ctrl+p and ctrl+n.
+// Claiming the mouse with -mouse turns the swipe into wheel reports and hands the arrows
+// back to the history. This default is one leg of the phone arrangement — surface, mouse,
+// arrows, notch — that only holds as a set; see "The phone arrangement" in docs/PLAN.md,
+// and TestTheTermuxArrangement in main_test.go, which fails when the legs drift apart.
+func platformKeys(termux, mouse bool) map[string]app.Action {
+	if !termux || mouse {
+		return nil
+	}
+	return map[string]app.Action{
+		"up":   app.ActionScrollUp,
+		"down": app.ActionScrollDown,
+	}
+}
+
+// scrollFor layers the notch width the way the other two layer their decisions: what you
+// typed, then the file, then the platform. A phone's tracked swipe reports one row at a
+// time, so one row per notch keeps the page under the hand, and a synthesized arrow arrives
+// one at a time the same way; the shipped 3 stands on a desktop. A zero here is not a
+// value — the player fills it with its own default.
+func scrollFor(fs *flag.FlagSet, scroll int, termux bool) int {
+	if given(fs, "scroll") || scroll > 0 {
+		return scroll
+	}
+	if termux {
+		return 1
+	}
+	return scroll
+}
+
 // given reports whether a flag was typed on this command line. A flag's value cannot answer
 // that question — every default is also a value somebody may have typed — and the difference
 // is exactly whether the config file gets to fill it in.
@@ -389,7 +766,7 @@ func given(fs *flag.FlagSet, name string) bool {
 // the config's [keys] table already built by the package that owns it, and it comes here
 // and not to fold for the same reason WheelLines does — a folded document has no keypress
 // to look up.
-func live(tty *term.TTY, sc *scenario.Scenario, em *ui.Emitter, g *ui.Glyphs, km *app.Keymap, controller app.ConfigController, o options) error {
+func live(tty *term.TTY, sc *scenario.Scenario, em *ui.Emitter, g *ui.Glyphs, km *app.Keymap, controller *config.Controller, o options) error {
 	// A panic must not leave a terminal in raw mode with the cursor hidden. Close is
 	// idempotent, so the explicit one below is still the one that reports a failure.
 	defer tty.Close()
@@ -405,6 +782,12 @@ func live(tty *term.TTY, sc *scenario.Scenario, em *ui.Emitter, g *ui.Glyphs, km
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	manager, err := orchestrator.New(ctx, controller, orchestrator.MinimalEnvironment())
+	if err != nil {
+		return err
+	}
+	// Processes must be gone before emitter Exit bytes and raw-mode teardown.
+	defer manager.Close()
 	// ISIG is off in raw mode, so ctrl+c reaches the player as a keypress — where it clears
 	// the input line and takes a second press to leave, App.interrupt's job — and a signal
 	// arriving here is somebody else killing us rather than the reader asking to stop. The
@@ -431,7 +814,13 @@ func live(tty *term.TTY, sc *scenario.Scenario, em *ui.Emitter, g *ui.Glyphs, km
 		// Only here. A fold has no wheel to turn.
 		WheelLines: o.scroll,
 		InputTitle: o.title,
+		// The [layout] table, parsed and validated by the config reader. A fold has
+		// it too, for the same reason it has the title: a config that reorders the
+		// chrome and could not be seen doing it on the only path with text output
+		// would be a setting nobody could check.
+		Layout:     o.layout,
 		Config:     controller,
+		Extensions: manager,
 		// Only here either, and for the same kind of reason: a fold has no clock to animate
 		// against. A folded frame would draw one arbitrary tick of the sweep and call it the
 		// document, which is worse than drawing none.
@@ -449,11 +838,17 @@ func live(tty *term.TTY, sc *scenario.Scenario, em *ui.Emitter, g *ui.Glyphs, km
 	//
 	// Termux is the terminal that shows what the rule is really about. It never consults 1007,
 	// so an unclaimed swipe arrives as the arrows themselves and there is no switch to throw;
-	// play answers it by claiming the mouse, which is the same answer as everywhere else. A
-	// terminal changes whether a notch arrives, and how. It never changes what a key means.
+	// play answers it by releasing the mouse, which keeps the tap and lets the swipe read as
+	// what it looks like. A terminal changes whether a notch arrives, and how. It never
+	// changes what a key means.
 
 	a := app.New(cfg)
-	err := a.Run()
+	err = a.Run()
+	// Extension shutdown is part of the live surface: complete it before terminal
+	// Exit bytes restore the cursor/screen and before raw mode is released.
+	if cerr := manager.Close(); err == nil {
+		err = cerr
+	}
 	if _, werr := tty.Write(em.Exit()); err == nil {
 		err = werr
 	}
@@ -499,7 +894,7 @@ func forward(ctx context.Context, in <-chan term.Event, out chan<- term.Event) {
 // setting nobody could check.
 func fold(sc *scenario.Scenario, em *ui.Emitter, g *ui.Glyphs, o options) error {
 	em.Mode = ui.ModeInline
-	a := app.New(app.Config{Scenario: sc, Emitter: em, Glyphs: g, Width: o.width, InputTitle: o.title})
+	a := app.New(app.Config{Scenario: sc, Emitter: em, Glyphs: g, Width: o.width, InputTitle: o.title, Layout: o.layout})
 	_, err := fmt.Println(a.Fold().Plain())
 	return err
 }
@@ -571,6 +966,10 @@ func keys() error {
 	for _, s := range ui.SlotKeys {
 		fmt.Printf("  %-10s %s\n", s.Slot, s.Doc)
 	}
+	fmt.Println("\nwidgets — [layout], the names a slot's list may hold, in the order they stack by default")
+	for _, w := range app.CompositionWidgets() {
+		fmt.Printf("  %-12s %-12s %s\n", w.Name, string(w.Slot), w.Doc)
+	}
 	return nil
 }
 
@@ -620,14 +1019,57 @@ func checkScenario(path string) error {
 // file was silent about is missing from that line rather than printed as a zero, so what comes
 // back is the shape of what they wrote.
 //
+// The file's directory decides its role: a .toml inside the themes dir is read as a theme
+// pack — [glyphs], [styles] and [anim] and nothing else — and any other .toml as an ordinary
+// config. A config that names a theme gets that pack resolved and validated with it, so one
+// check reports both files; a pack that is missing or broken fails the check of the config
+// that named it, which is where the reader will be looking when it matters.
+//
 // Its errors go out as they come, without the indent load() gives a recording's: every one of
 // them already begins with path:line:, which is the shape an editor jumps to, and two spaces
 // in front of it is exactly what stops it being one.
 func checkConfig(path string) error {
-	f, err := config.Load(path)
+	data, err := os.ReadFile(path)
 	if err != nil {
 		return err
 	}
-	fmt.Printf("%s: ok — %s\n", path, f.Summary())
+	var f *config.File
+	if inThemesDir(path) {
+		f, err = config.ParseTheme(path, data)
+	} else {
+		f, err = config.Parse(path, data)
+	}
+	if err != nil {
+		return err
+	}
+	line := fmt.Sprintf("%s: ok — %s", path, f.Summary())
+	if !inThemesDir(path) && f.ThemeName != "" {
+		pack, err := config.LoadTheme(f.ThemeName)
+		if err != nil {
+			return err
+		}
+		line += fmt.Sprintf(" — theme %s: ok — %s", strconv.Quote(f.ThemeName), pack.Summary())
+	}
+	fmt.Println(line)
 	return nil
+}
+
+// inThemesDir answers whether a path is a theme pack's home: its directory, resolved,
+// is the themes dir. It is a location question and nothing else — the same file
+// elsewhere is an ordinary config, because a role follows the address and not the
+// content, which is what keeps `check` from guessing at formats.
+func inThemesDir(path string) bool {
+	dir := config.ThemesDir()
+	if dir == "" {
+		return false
+	}
+	abs, err := filepath.Abs(filepath.Dir(path))
+	if err != nil {
+		return false
+	}
+	absDir, err := filepath.Abs(dir)
+	if err != nil {
+		return false
+	}
+	return strings.EqualFold(abs, absDir)
 }

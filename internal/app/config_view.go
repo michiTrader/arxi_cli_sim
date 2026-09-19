@@ -144,20 +144,49 @@ func (a *App) configSnapshot() ConfigSnapshot {
 		s.Categories[i].Rows = append([]ConfigRow(nil), s.Categories[i].Rows...)
 	}
 	for i := range s.Categories {
-		if s.Categories[i].Name != "Session" {
-			continue
-		}
-		for j := range s.Categories[i].Rows {
-			switch s.Categories[i].Rows[j].ID {
-			case "session.effort":
-				s.Categories[i].Rows[j].Value, s.Categories[i].Rows[j].Effective = a.st.Effort, a.st.Effort
-			case "session.recap":
-				v := strconv.FormatBool(a.st.Recap)
-				s.Categories[i].Rows[j].Value, s.Categories[i].Rows[j].Effective = v, v
+		switch s.Categories[i].Name {
+		case "Layout":
+			a.resolveLayoutRows(s.Categories[i].Rows)
+		case "Session":
+			for j := range s.Categories[i].Rows {
+				switch s.Categories[i].Rows[j].ID {
+				case "session.effort":
+					s.Categories[i].Rows[j].Value, s.Categories[i].Rows[j].Effective = a.st.Effort, a.st.Effort
+				case "session.recap":
+					v := strconv.FormatBool(a.st.Recap)
+					s.Categories[i].Rows[j].Value, s.Categories[i].Rows[j].Effective = v, v
+				}
 			}
 		}
 	}
 	return s
+}
+
+// resolveLayoutRows fills the Layout inspector's effective column with the order the
+// current frame actually uses, tiers resolved against the terminal's width and height.
+// The controller owns what the file said and the default beside it; the app owns this
+// one fact because it is the only layer that knows the live geometry and the tier rules.
+func (a *App) resolveLayoutRows(rows []ConfigRow) {
+	resolved := layoutFor(a.layout, a.vp.Width, a.vp.Height)
+	defaults := map[ui.Slot][]string{}
+	for _, w := range CompositionWidgets() {
+		defaults[w.Slot] = append(defaults[w.Slot], w.Name)
+	}
+	for i := range rows {
+		id := string(rows[i].ID)
+		if !strings.HasPrefix(id, "layout.") {
+			continue
+		}
+		slot := ui.Slot(strings.TrimPrefix(id, "layout."))
+		names, ok := resolved[slot]
+		if !ok {
+			names = defaults[slot]
+		}
+		rows[i].Effective = strings.Join(names, ", ")
+		if rows[i].Effective == "" {
+			rows[i].Effective = "(empty)"
+		}
+	}
 }
 
 func (v *configViewState) clamp(s ConfigSnapshot) {

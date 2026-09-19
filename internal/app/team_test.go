@@ -120,8 +120,11 @@ func TestTeamDrawUsesCurrentFoldedState(t *testing.T) {
 }
 
 func TestTeamViewEntryKeyIsolationAndRestoration(t *testing.T) {
-	if got := DefaultBindings()["ctrl+t"]; got != ActionTeam {
-		t.Fatalf("ctrl+t = %q", got)
+	// ctrl+t now belongs to the task panel. The team action is still declared and
+	// still works when something reaches it — the slash menu by default, a [keys]
+	// binding by choice — which the rebind test below pins.
+	if got := DefaultBindings()["ctrl+t"]; got != ActionTasks {
+		t.Fatalf("ctrl+t = %q, want the tasks action", got)
 	}
 	a := New(Config{Width: 40, Height: 8})
 	a.st = teamFixture()
@@ -142,6 +145,25 @@ func TestTeamViewEntryKeyIsolationAndRestoration(t *testing.T) {
 	a.dispatch(ActionCancel, mustKey(t, "esc"))
 	if a.view != viewConversation || !a.scrolled || a.top != 7 || a.ed.Text() != "draft" {
 		t.Fatalf("conversation not restored: view=%v scroll=%v/%d text=%q", a.view, a.scrolled, a.top, a.ed.Text())
+	}
+}
+
+// TestTeamActionRemainsBindable is the other half of giving ctrl+t away: the team
+// action is still a first-class action, so a config can put it back on any key it
+// likes and that key opens the roster.
+func TestTeamActionRemainsBindable(t *testing.T) {
+	km, err := NewKeymap(map[string]Action{"ctrl+t": ActionTeam})
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := New(Config{Width: 40, Height: 8, Keymap: km})
+	a.st = teamFixture()
+	k := mustKey(t, "ctrl+t")
+	if got := a.km.Lookup(k); got != ActionTeam {
+		t.Fatalf("ctrl+t resolved to %q after the override", got)
+	}
+	if !a.dispatch(ActionTeam, k) || a.view != viewTeam {
+		t.Fatal("a rebound ctrl+t did not open the team roster")
 	}
 }
 

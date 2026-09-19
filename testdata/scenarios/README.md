@@ -75,7 +75,7 @@ Recorded provenance is carried by the replay extensions on `run.started`: `cwd` 
 Likewise, context occupancy is an exact response metric and is never inferred from
 `tokens_in`, whose value remains the latest response's input-token count.
 
-## The twelve recordings
+## The thirteen recordings
 
 | file | what it is for |
 | --- | --- |
@@ -91,6 +91,7 @@ Likewise, context occupancy is an exact response metric and is never inferred fr
 | `10-markdown.ndjson` | a reply written in markdown, arriving one delta at a time |
 | `11-team-blocked.ndjson` | the dedicated Team monitor, recorded provenance, and exact context |
 | `12-tasks-live.ndjson` | live Tasks creation, partial updates, status transitions, and continued run output |
+| `13-deep-thinking.ndjson` | two long thinking parts, deltas every 80 ms, and recorded provenance |
 
 **01 — first conversation.** One agent, one `read`, one `bash` denied by policy,
 an approval inbox that blocks the run until it is answered, and prose with a
@@ -269,6 +270,16 @@ Creation order remains stable across every update. Tasks and `/tasks` are simula
 inspired by Claude Code; the `sim.task.*` family remains a replay extension rather than
 an upstream arxi contract.
 
+**13 — deep thinking.** Two long thinking parts whose deltas arrive every 80 ms with
+a few hundred characters each, so an open thought stays open long enough to watch the
+fold's one-line marquee run: `Thinking ·` and the tail of the text, pushed leftward
+past the label by every delta, losing its oldest words off the left edge. It also
+exercises the collapse back to `Thought · a few seconds (high effort)` on
+`llm.part_done`, twice, around ordinary text and tool output — at output levels 1 and
+2 the fold is the whole story, and level 3 streams the text expanded as always. It
+records provenance too, so the status row's `D:\projects\arxi ⑂ tasks-monitor` reads
+with the single space the separator carries.
+
 ## Playing one
 
 Flags come before the file: Go's `flag` package stops at the first non-flag
@@ -285,9 +296,11 @@ In a terminal, `y` and `n` answer an approval, a typed line becomes a real
 `run.prompt` at an `{"await": "prompt"}` barrier, and `ctrl+d` leaves — `ctrl+c`
 clears the input line and only leaves on a second press in a row. The wheel is
 left to the terminal so that a drag still selects, and `ctrl+↑`/`alt+↑`/`pgup`
-move the conversation; `-mouse` trades that the other way. On Termux the trade has
-no other side and the mouse is claimed for you, because a swipe there arrives as
-the arrow keys and would otherwise walk the input's history. `-instant`
+move the conversation; `-mouse` trades that the other way. On Termux the mouse
+is released for you — a claimed tap is a report, and the report is the soft
+keyboard never coming back — so a swipe there arrives as the plain arrows and
+scrolls the conversation, one row a report, while the input history keeps
+`ctrl+p`/`ctrl+n`. `-instant`
 folds the whole log and prints the last frame as plain text, which is also what
 happens when stdin is not a terminal — a pipe, a CI job, a `| less`. `check` loads
 and validates without playing, which is what a recording gets edited under.

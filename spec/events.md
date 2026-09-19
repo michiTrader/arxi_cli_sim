@@ -109,6 +109,12 @@ interface is unsupportable without each one:
    predate the alignment of arxi's spec; when the host contract lands, the
    player renames the fields in `internal/event/payload.go` and nothing else —
    that is the file the code already points to as the one that changes.
+6. **Extension attribution.** The player's extension plan
+   (`docs/PLAN-ui-customization.md`) needs an extension to propose events the
+   way a human does — never a new `source` invented sim-side. Until arxi names
+   one, extensions propose with a `source` from this table's closed set and
+   `actor` = extension name; whether extensions deserve a `source` of their own
+   is a wire decision that belongs here, next to the others.
 
 ## Merge rule
 

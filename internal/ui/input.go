@@ -29,7 +29,16 @@ type Input struct {
 	// the marker inside the box already says a prompt goes here, so "prompt" spent four
 	// columns of border and a reader's attention repeating it. A caller with something
 	// worth putting there — a mode, a branch, a model — sets it.
-	Title   string
+	Title string
+
+	// Hint is a word let into the right end of the top border, opposite the title. It
+	// is a transient — the caller holds it up for a moment and takes it down — so it
+	// reports what just happened rather than what the box is, and it owns the right
+	// end because the title owns the left. Render drops one that does not fit, and
+	// drops it before it would crowd the title: the title names the mode the box is
+	// in, and a notice that costs the mode its name is a notice drawn in the wrong
+	// place. Empty draws nothing, which is nearly all of the time.
+	Hint    string
 	history []string
 	histIdx int // len(history) means "editing a fresh line"
 	stash   string
@@ -43,13 +52,27 @@ type Input struct {
 	// hands in the phase, because the editor has no idea what the program is doing and no
 	// timer of its own to find out with.
 	Shine Shimmer
+
+	// TitleShine is the band of light that crosses the title in the top border, measured
+	// against the title and not against the row. Its zero value is no light, and it is a
+	// separate field from Shine because the two bands mean opposite things: the box's own
+	// light says "it is your turn", while the one the player arms here says the opposite —
+	// it travels with the working verb that now lives in the border, on the same status
+	// shimmer and the same clock that verb has always been on.
+	TitleShine Shimmer
 }
 
 // Animated reports whether the next frame of this editor differs from this one, which is
-// true exactly while a shine is armed — the same question a Widget answers, asked of the
-// one drawable in this package that is not one. The app ORs it in beside the widgets, so
-// arming a shine is all it takes to get the ticks that move it.
-func (in *Input) Animated() bool { return in.Shine.On() }
+// true while either of its bands is armed — the same question a Widget answers, asked of
+// the one drawable in this package that is not one. The app ORs it in beside the widgets,
+// so arming a shine is all it takes to get the ticks that move it.
+func (in *Input) Animated() bool { return in.Shine.On() || in.TitleShine.On() }
+
+// NextVisualChange delegates precise scheduling to whichever band on this frame is
+// armed and due soonest.
+func (in *Input) NextVisualChange() int {
+	return sooner(in.Shine.NextVisualChange(), in.TitleShine.NextVisualChange())
+}
 
 // NewInput returns an empty editor.
 func NewInput() *Input {
@@ -295,7 +318,7 @@ func (in *Input) Render(width int, g Glyphs) ([]Line, Cursor) {
 	}
 
 	out := make([]Line, 0, len(body)+2)
-	out = append(out, rule("frame.tl", "frame.tr", title, width, g))
+	out = append(out, rule("frame.tl", "frame.tr", title, in.Hint, width, g, in.TitleShine))
 	for _, l := range body {
 		// The padding is never zero — a row is at most room columns and room is two short
 		// of inner — so the last cell of every line is the border glyph and never a space,
@@ -303,7 +326,7 @@ func (in *Input) Render(width int, g Glyphs) ([]Line, Cursor) {
 		l = append(append(Line{v, pad(1)}, l...), pad(inner-1-l.Width()), v)
 		out = append(out, l)
 	}
-	out = append(out, rule("frame.bl", "frame.br", "", width, g))
+	out = append(out, rule("frame.bl", "frame.br", "", "", width, g, Shimmer{}))
 	cur.Line++
 	cur.Col += vw + 1
 	return in.shine(out, width), cur
@@ -336,7 +359,20 @@ func (in *Input) shine(rows []Line, width int) []Line {
 // not fit with a horizontal on each side of it is dropped rather than truncated, because
 // half a word in a border reads as a rendering fault, and the box says what it is for
 // perfectly well by being a box.
-func rule(left, right, title string, width int, g Glyphs) Line {
+//
+// tail, when there is one, rides the far corner, mirrored on the title's own
+// arithmetic: a whole horizontal between it and the corner, and the middle run
+// shortened by the lead it costs. The title outranks it — the title is the box's
+// mode, the tail is a moment's notice — so when both cannot fit the fit test drops
+// the tail and the border keeps saying what the box is.
+//
+// shine is lit across the title alone, measured against the title's own width and not
+// the row's, so a band over a nine-column word is a glint on a word rather than a wave
+// happening to pass through the left of the rule. The title spans are appended as a
+// Line rather than one Span because Apply only ever divides spans: the lit pieces
+// still measure exactly what the title measured, and the run arithmetic around them
+// is untouched.
+func rule(left, right, title, tail string, width int, g Glyphs, shine Shimmer) Line {
 	l, r := g.Span(left, "input.frame"), g.Span(right, "input.frame")
 	mid := width - ansi.StringWidth(l.Text) - ansi.StringWidth(r.Text)
 	if mid < 0 {
@@ -349,8 +385,23 @@ func rule(left, right, title string, width int, g Glyphs) Line {
 	// title floating between two gaps rather than a word let into a rule.
 	lead := max(1, ansi.StringWidth(g.Get("frame.h")))
 	if t := " " + title + " "; title != "" && ansi.StringWidth(t)+2*lead <= mid {
-		out = append(out, hrun(lead, g), Span{Text: t, Style: "input.title"})
+		out = append(out, hrun(lead, g))
+		titleLine := Line{Span{Text: title, Style: "input.title"}}
+		if shine.On() {
+			titleLine = shine.Apply(titleLine, ansi.StringWidth(title))
+		}
+		out = append(out, Span{Text: " "})
+		out = append(out, titleLine...)
+		out = append(out, Span{Text: " "})
 		mid -= lead + ansi.StringWidth(t)
+	}
+	if w := ansi.StringWidth(" " + tail + " "); tail != "" && w+2*lead <= mid {
+		out = append(out, hrun(mid-lead-w, g))
+		out = append(out, Span{Text: " "})
+		out = append(out, Span{Text: tail, Style: "input.hint"})
+		out = append(out, Span{Text: " "})
+		out = append(out, hrun(lead, g))
+		return append(out, r)
 	}
 	if mid > 0 {
 		out = append(out, hrun(mid, g))
@@ -512,6 +563,28 @@ func (in *Input) runeAtPos(targetLine, targetCol, room int) int {
 		col += w
 	}
 	return best
+}
+
+// HostsTitle reports whether Render would draw title into the top border at width w:
+// the box has to exist, and the title has to fit with a horizontal on each side of it.
+// It is the same arithmetic Render and rule run, answered before anything is drawn, so
+// a caller deciding where the working verb lives this frame does not have to guess —
+// a border that will not be drawn has no title to host it, and a word dropped by the
+// fit test is a verb nowhere.
+func (in *Input) HostsTitle(title string, width int, g Glyphs) bool {
+	key := in.Prompt
+	if key == "" {
+		key = "input.marker"
+	}
+	hw := Line{g.Span(key, "input.marker")}.Width()
+	vw := ansi.StringWidth(g.Span("frame.v", "input.frame").Text)
+	if width-hw-2*vw-2 < 2 {
+		return false // the box itself is not drawn at this width
+	}
+	lw := ansi.StringWidth(g.Get("frame.tl"))
+	rw := ansi.StringWidth(g.Get("frame.br"))
+	lead := max(1, ansi.StringWidth(g.Get("frame.h")))
+	return ansi.StringWidth(" "+title+" ")+2*lead <= width-lw-rw
 }
 
 // Room returns the number of columns available for text at the given frame width,

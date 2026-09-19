@@ -67,6 +67,9 @@ const (
 
 	ActionComplete Action = "complete"
 	ActionTeam     Action = "team"
+	ActionTasks    Action = "tasks"
+
+	ActionOutputLevel Action = "output-level"
 )
 
 // ActionDecl is one declared action and the line that explains it. The doc is not a
@@ -131,6 +134,16 @@ var ActionKeys = []ActionDecl{
 
 	{ActionComplete, "in the slash menu, fill the command text without running it"},
 	{ActionTeam, "open the team roster and live member state"},
+	{ActionTasks, "toggle the task panel between the summary and the expanded list"},
+	{ActionOutputLevel, "cycle how much of the transcript shows: compact, standard, full"},
+}
+
+// slashReachable are the declared actions a default key does not reach because the
+// slash menu already does, and the slash menu cannot be rebound away. The team action
+// gave ctrl+t to the task panel and kept /team; a reader who wants it on a key again
+// binds it under [keys], where every declared action is accepted.
+var slashReachable = map[Action]bool{
+	ActionTeam: true,
 }
 
 // actionIndex fails the build's first test rather than the user's first keypress: a
@@ -250,6 +263,13 @@ func DefaultBindings() map[string]Action {
 		// that is made safe, both ways round — claiming tracking turns the translation off, and so
 		// does switching 1007 off when tracking is not claimed. ctrl+p and ctrl+n stay bound
 		// beside them: readline's own names for the same two steps, and a habit is worth an entry.
+		//
+		// The one sender this table cannot disarm is a phone: Termux synthesizes the arrows
+		// themselves for an unclaimed swipe on the alternate buffer and has no 1007 to switch
+		// the synthesis off, so there the bytes arrive whichever way the mouse is set. The
+		// choice is not made here — play layers a platform default above this table that gives
+		// a released swipe to the scroll actions, and the history keeps ctrl+p and ctrl+n — and
+		// the table stays one table.
 		"up":     ActionHistoryPrev,
 		"down":   ActionHistoryNext,
 		"ctrl+p": ActionHistoryPrev,
@@ -308,7 +328,16 @@ func DefaultBindings() map[string]Action {
 		"n": ActionDeny,
 
 		"tab":    ActionComplete,
-		"ctrl+t": ActionTeam,
+		"ctrl+t": ActionTasks,
+
+		// ctrl+o walks the transcript's output levels — compact, standard, full, and
+		// back to compact — which is the key Claude Code taught for "show me more of
+		// what happened". It is a cycle and not a toggle because the question has three
+		// answers: the compact level a session opens at keeps the run's shape, the
+		// standard one is the transcript as it has always been drawn, and the full one
+		// spends the rows on what state kept of a thought, a result and a diff. The key
+		// steps; the reader stops where the detail is right.
+		"ctrl+o": ActionOutputLevel,
 	}
 }
 

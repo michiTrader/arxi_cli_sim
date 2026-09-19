@@ -9,6 +9,8 @@ import (
 	"testing"
 
 	"arxi.local/sim/internal/config"
+	"arxi.local/sim/internal/ext"
+	"strconv"
 )
 
 func loadDocument(t *testing.T, body string) (*config.Document, string) {
@@ -22,6 +24,63 @@ func loadDocument(t *testing.T, body string) (*config.Document, string) {
 		t.Fatal(err)
 	}
 	return d, path
+}
+
+func TestDocumentPersistsExactExtensionAllow(t *testing.T) {
+	dir := t.TempDir()
+	manifest := filepath.Join(dir, "manifest.toml")
+	if err := os.WriteFile(manifest, []byte("name = \"clock\"\nversion = \"1\"\nprotocol = \"ext/v1\"\nexecutable = \"clock\"\ncapabilities = [\"events.subscribe\", \"events.emit\"]\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	body := "# keep\n[extensions.clock]\nmanifest = " + strconv.Quote(manifest) + "\nallow  = [\"events.subscribe\"] # consent\n"
+	path := filepath.Join(dir, "config.toml")
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	d, err := config.LoadDocument(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := d.SetExtensionAllow("clock", ext.NewCapabilitySet(ext.Capability("events.emit"))); err != nil {
+		t.Fatal(err)
+	}
+	want := strings.Replace(body, `["events.subscribe"]`, `["events.emit"]`, 1)
+	if got := string(d.Bytes()); got != want {
+		t.Fatalf("got %q, want %q", got, want)
+	}
+	if _, err := d.Render(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestRegisterManagedExtensionLosslessCRLFAndConflict(t *testing.T) {
+	dir := t.TempDir()
+	manifest := filepath.Join(dir, "pkg", "manifest.toml")
+	if err := os.MkdirAll(filepath.Dir(manifest), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(manifest, []byte("name=\"clock\"\nversion=\"1\"\nprotocol=\"ext/v2\"\nexecutable=\"clock\"\ncapabilities=[\"panel.render\"]\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	body := "# keep\r\n[input]\r\ntitle = \"x\" # comment\r\n"
+	d, path := loadDocument(t, body)
+	if err := d.RegisterExtension("clock", config.ManagedExtension{Manifest: manifest, Enabled: true, PackageDigest: "abc", Generation: 2}); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(string(d.Bytes()), body) || strings.Contains(strings.ReplaceAll(string(d.Bytes()), "\r\n", ""), "\n") {
+		t.Fatalf("not lossless CRLF: %q", d.Bytes())
+	}
+	f, err := config.Parse(path, d.Bytes())
+	if err != nil {
+		t.Fatal(err)
+	}
+	x := f.Extensions["clock"]
+	if x.PackageDigest != "abc" || x.Generation != 2 || x.Identity != "" || len(x.Allow) != 0 {
+		t.Fatalf("round trip: %#v", x)
+	}
+	if err := d.RegisterExtension("clock", config.ManagedExtension{Manifest: manifest}); !errors.Is(err, config.ErrValidation) {
+		t.Fatalf("collision = %v", err)
+	}
 }
 
 func TestDocumentRoundTripIsByteIdentical(t *testing.T) {

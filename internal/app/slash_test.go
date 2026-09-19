@@ -99,6 +99,29 @@ func TestSlashMenuSubmitExecutesCommand(t *testing.T) {
 	}
 }
 
+// The plain arrows are bound to the scroll actions on a phone whose mouse is released —
+// that is the only channel its swipe has — so the menu has to move on the scroll actions
+// the way the effort slider and the config view already do.
+func TestSlashMenuMovesOnTheScrollActions(t *testing.T) {
+	a := New(Config{Width: 72, Height: 24})
+	a.ed.Insert("/")
+	a.smenu = slashMenuFor(a.ed.Text(), a.smenu)
+	if !a.smenu.Active() {
+		t.Fatal("menu should be active")
+	}
+	first := a.smenu.Selected().Name
+	if !a.dispatch(ActionScrollDown, mustKey(t, "down")) {
+		t.Fatal("scroll-down did not reach the menu")
+	}
+	if a.smenu.Selected().Name == first {
+		t.Fatal("the scroll action did not move the selection")
+	}
+	a.dispatch(ActionScrollUp, mustKey(t, "up"))
+	if a.smenu.Selected().Name != first {
+		t.Fatal("scroll-up did not move the selection back")
+	}
+}
+
 func TestSlashMenuTabFillsInput(t *testing.T) {
 	a := New(Config{Width: 72, Height: 24})
 	a.ed.Insert("/")

@@ -1,0 +1,10 @@
+┌ Deploy 日┐
+│Running   │
+│health    │
+│checks    │
+│✓ api 東京│
+│Latency is│
+│above the │
+│preferred │
+│threshold │
+┌ ↑↓ scroll┘

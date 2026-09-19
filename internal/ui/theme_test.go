@@ -1,9 +1,12 @@
 package ui
 
 import (
+	"fmt"
+	"path/filepath"
 	"sort"
 	"testing"
 
+	"arxi.local/sim/internal/event"
 	"arxi.local/sim/internal/state"
 )
 
@@ -25,12 +28,42 @@ import (
 var notYetDrawn = map[string]string{}
 
 // drawnKeys renders everything the simulator can currently draw and reports which
-// style keys came out, the way emit would resolve them.
-func drawnKeys(t *testing.T) (used, unknown map[string]bool) {
+// style keys came out, the way emit would resolve them. Every key comes back with the
+// sources that drew it, because "somewhere" is not an answer a maintainer can act on:
+// when a key stops being drawn the audit should say which drawer stopped, and when a
+// key is invented it should say where. The sources are named for what drew them —
+// widget:<Name> for chrome, surface:<name> for the things that are not widgets,
+// corpus/<recording>@<width> for played frames, literal:<family> for the vocabularies
+// whose widgets live in internal/app and can only be stood in for here.
+func drawnKeys(t *testing.T) (used, unknown map[string]bool, owners map[string]map[string]bool) {
 	t.Helper()
 	th := DefaultTheme()
 	th.Track = true
 	used, unknown = map[string]bool{}, map[string]bool{}
+	owners = map[string]map[string]bool{}
+	record := func(src, key string) {
+		if key == "" {
+			return
+		}
+		th.Resolve(key)
+		if Declared(key) {
+			used[key] = true
+		} else {
+			unknown[key] = true
+		}
+		if owners[key] == nil {
+			owners[key] = map[string]bool{}
+		}
+		owners[key][src] = true
+	}
+	collect := func(src string, lines []Line) {
+		for _, l := range lines {
+			for _, sp := range l {
+				record(src, sp.Style)
+				record(src, sp.Fill)
+			}
+		}
+	}
 
 	// Every prefix of every named recording, at two widths. The prefixes are the point:
 	// a key can be on the screen for one step and gone by the next — tool.marker.pending
@@ -52,51 +85,37 @@ func drawnKeys(t *testing.T) (used, unknown map[string]bool) {
 					in.SetText("go test ./internal/...")
 				}
 				f := render(r, st, in, Viewport{Width: w, Height: 40})
-				for _, l := range append(append([]Line{}, f.Committed...), f.Live...) {
-					for _, sp := range l {
-						// Fill is a style key like any other: emit resolves it and merges
-						// it under Style. A test that read only Style would report a diff
-						// band as undrawn while it was on the screen.
-						for _, key := range [2]string{sp.Style, sp.Fill} {
-							if key == "" {
-								continue
-							}
-							th.Resolve(key)
-							if Declared(key) {
-								used[key] = true
-							} else {
-								unknown[key] = true
-							}
-						}
-					}
-				}
+				collect(fmt.Sprintf("corpus/%s@%d", filepath.Base(path), w),
+					append(append([]Line{}, f.Committed...), f.Live...))
 			}
 		}
 	}
 	// Markdown constructs the scenario happens not to contain are still part of
 	// the interface, so they are drawn here rather than left unproven.
-	collect := func(lines []Line) {
-		for _, l := range lines {
-			for _, sp := range l {
-				if sp.Style != "" {
-					used[sp.Style] = true
-				}
-				if sp.Fill != "" {
-					used[sp.Fill] = true
-				}
-			}
-		}
-	}
 	g := DefaultGlyphs()
-	collect(RenderMarkdown("- a bullet\n- another one\n", 72, g))
+	collect("surface:markdown", RenderMarkdown("- a bullet\n- another one\n", 72, g))
 	// Both of a table's forms, because they do not draw the same keys: the grid has a
 	// frame and the narrow form deliberately has none, so playing only one of them would
 	// leave a declared key unproven or an undeclared one unnoticed. The corpus does have
 	// tables — 02 and 06 — but neither of those is a recording drawnKeys plays.
-	collect(RenderMarkdown(sampleTable, 72, g))
-	collect(RenderMarkdown(sampleTable, 20, g))
-	collect((NoticeWidget{Text: "budget at 80%", Warn: true}).Render(72, 0, g))
-	collect(BlockFor(editWithDiff()).Render(72, g))
+	collect("surface:markdown", RenderMarkdown(sampleTable, 72, g))
+	collect("surface:markdown", RenderMarkdown(sampleTable, 20, g))
+	collect("widget:notice", (NoticeWidget{Text: "budget at 80%", Warn: true}).Render(72, 0, g))
+	collect("transcript:diff", BlockFor(editWithDiff()).Render(72, g))
+	// The compact output level's own vocabulary. The sweeps above play every recording
+	// at the standard level — NewRenderer's zero value is the standard one — so the
+	// two words and the two counts the compact level exists to draw would be declared
+	// and never drawn without this. The items are the ones the level is for: a call
+	// that failed, one the policy refused, and an edit whose diff folds into its two
+	// counts.
+	compact := []state.Item{
+		{Kind: state.KindTool, ID: "tool-compact-failed", Tool: "bash", Args: map[string]any{"cmd": "go test ./internal/auth/..."}, Status: state.ToolFailed, Summary: "FAIL internal/auth"},
+		{Kind: state.KindTool, ID: "tool-compact-denied", Tool: "bash", Args: map[string]any{"cmd": "rm -rf ./build"}, Status: state.ToolDenied, Policy: "deny"},
+		editWithDiff(),
+	}
+	for _, it := range compact {
+		collect("surface:transcript", ItemBlock{It: it, Detail: DetailCompact}.Render(72, g))
+	}
 	// The status row, which no recording draws: the app installs it, and the renderer this
 	// test drives installs ChromeFor's widgets only. It is built from a literal rather than
 	// from a played step because it is the one widget whose keys depend on which of its
@@ -116,7 +135,7 @@ func drawnKeys(t *testing.T) (used, unknown map[string]bool) {
 		},
 	}
 	for _, w := range []int{120, 24} {
-		collect((StatusWidget{St: spinning, Phase: 2}).Render(w, 0, g))
+		collect("widget:status", (StatusWidget{St: spinning, Phase: 2}).Render(w, 0, g))
 	}
 	// A titled input, for the same reason and with a sharper edge: the border's word is
 	// empty by default now, so the sweep above — which builds its editors with NewInput —
@@ -128,7 +147,19 @@ func drawnKeys(t *testing.T) (used, unknown map[string]bool) {
 		in := NewInput()
 		in.Title = "prompt"
 		rows, _ := in.Render(w, g)
-		collect(rows)
+		collect("widget:input", rows)
+	}
+	// The hint rides the title's end of the rule, and like the title it is unasked-for
+	// by the sweep above: an editor nobody told about it draws an unbroken rule. It is
+	// drawn beside the title at two widths because the fit test drops the tail when
+	// the title and it cannot both fit, and one width would make that coin toss a
+	// failure of the test's own making.
+	for _, w := range []int{72, 40} {
+		in := NewInput()
+		in.Title = "prompt"
+		in.Hint = "Output level 2/3"
+		rows, _ := in.Render(w, g)
+		collect("widget:input", rows)
 	}
 	// The two bands of light, which nothing above can reach: a shimmer's zero value is off, so
 	// every editor and every status row built anywhere else in this function draws the frame
@@ -149,8 +180,8 @@ func drawnKeys(t *testing.T) (used, unknown map[string]bool) {
 	shining := NewInput()
 	shining.Shine = Shimmer{Style: InputShine, Phase: 5}
 	litRows, _ := shining.Render(72, g)
-	collect(litRows)
-	collect((StatusWidget{
+	collect("widget:input", litRows)
+	collect("widget:status", (StatusWidget{
 		St: spinning, Phase: 2,
 		Shine: Shimmer{Style: StatusShine, Phase: 5},
 	}).Render(120, 0, g))
@@ -162,12 +193,12 @@ func drawnKeys(t *testing.T) (used, unknown map[string]bool) {
 	//
 	// Then the same bar again with the pointer on it, which is a third key and cannot come out of
 	// the first call: held is a style and not a glyph, so the only way to see it is to hold it.
-	collect((ScrollbarWidget{Scroll: Scroll{Above: 40, Rows: 12, Below: 90}}).Render(SideCols, 12, g))
-	collect((ScrollbarWidget{Scroll: Scroll{Above: 40, Rows: 12, Below: 90}, Held: true}).Render(SideCols, 12, g))
+	collect("widget:scrollbar", (ScrollbarWidget{Scroll: Scroll{Above: 40, Rows: 12, Below: 90}}).Render(SideCols, 12, g))
+	collect("widget:scrollbar", (ScrollbarWidget{Scroll: Scroll{Above: 40, Rows: 12, Below: 90}, Held: true}).Render(SideCols, 12, g))
 	// The overlay, which nothing above draws: the renderer composites it only when
 	// Renderer.Overlay is set, and the sweeps above leave it nil. Build one with a
 	// highlighted row so every overlay key is proven.
-	collect(Composite(
+	collect("surface:overlay", Composite(
 		[]Line{
 			{pad(72)}, {pad(72)}, {pad(72)}, {pad(72)}, {pad(72)},
 		},
@@ -181,13 +212,59 @@ func drawnKeys(t *testing.T) (used, unknown map[string]bool) {
 		},
 		72, g,
 	))
+	// The chrome widgets the sweeps above cannot reach in their own bodies: the app
+	// installs them, so no played frame of this test's renderer carries them, and the
+	// literal stands-in prove their vocabulary but not their code. Each is rendered
+	// here — the approval question with its timeout row, the tasks summary and the
+	// dropped panel past the row cap so the "… +N" count is drawn, the pinned header
+	// with more rows lost than it may repeat so the cut is marked, and the recap —
+	// under its own name, which is what makes an invented key in any of them name the
+	// widget that invented it.
+	approvalSt := &state.State{Inboxes: []*state.Inbox{
+		{ID: "inbox-1", Question: "May the agent write go.mod?", OnTimeout: "deny"},
+	}}
+	collect("widget:approval", (ApprovalWidget{Inbox: approvalSt.OpenInbox()}).Render(72, 0, g))
+	tasksSt := &state.State{Tasks: []*state.Task{
+		{ID: "task-1", Title: "Trace stale session cache", Owner: "scout", Status: event.TaskCompleted},
+		{ID: "task-2", Title: "Invalidate the cache entry", Owner: "builder", Status: event.TaskActive},
+		{ID: "task-3", Title: "Run the focused regression test", Owner: "reviewer", Status: event.TaskPending},
+		{ID: "task-4", Title: "Rerun the corpus", Owner: "builder", Status: event.TaskPending},
+		{ID: "task-5", Title: "Read the new warnings", Owner: "scout", Status: event.TaskPending},
+		{ID: "task-6", Title: "File the follow-up", Owner: "critic", Status: event.TaskPending},
+		{ID: "task-7", Title: "Tag the release", Owner: "mender", Status: event.TaskPending},
+		{ID: "task-8", Title: "Write the changelog", Owner: "builder", Status: event.TaskPending},
+	}}
+	collect("widget:tasks", (TasksWidget{St: tasksSt}).Render(72, 0, g))
+	collect("widget:tasks", (TasksWidget{St: tasksSt, Open: true}).Render(72, 10, g))
+	collect("widget:header", (HeaderWidget{Text: "please write the doc, quote the stderr line exactly, and note the timezone", Rows: 2}).Render(72, 0, g))
+	collect("widget:header", (HeaderWidget{Text: "a short turn", Rows: 1}).Render(72, 0, g))
+	recapSt := &state.State{Items: theRecapItems}
+	collect("widget:recap", (RecapWidget{St: recapSt}).Render(72, 0, g))
 	// Team and Tasks full views live in internal/app, so prove their public style
 	// vocabularies with the same literal-span boundary used for the effort widget below.
-	collect([]Line{
+	collect("literal:team", []Line{
 		{{Text: "scout", Style: "team.name"}},
 		{{Text: "role lead · model sonnet", Style: "team.meta"}},
 		{{Text: "working", Style: "team.state"}},
 		{{Text: "remedy: arxi inbox approve inbox-1", Style: "team.remedy"}},
+	})
+	panel := (ExtPanel{
+		Title: "Extension", Focused: true, Stale: true,
+		Rows: []ExtRow{{Spans: []ExtSpan{
+			{Text: "text", Role: ExtText}, {Text: " muted", Role: ExtMuted},
+			{Text: " accent", Role: ExtAccent}, {Text: " success", Role: ExtSuccess},
+			{Text: " warning", Role: ExtWarning}, {Text: " error", Role: ExtError},
+			{Text: " key", Role: ExtKey},
+		}}},
+		Footer: []ExtSpan{{Text: " footer", Role: ExtMuted}},
+	}).Render(80, 4)
+	collect("surface:extension", panel.Live)
+	// Unfocused rendering owns distinct frame/title keys.
+	panel = (ExtPanel{Title: "Extension"}).Render(40, 2)
+	collect("surface:extension", panel.Live)
+	collect("literal:extension-footer", []Line{{{Text: "footer", Style: "extension.footer"}}})
+
+	collect("literal:tasks", []Line{
 		{{Text: "Tasks 1/3", Style: "tasks.summary"}},
 		{{Text: "/tasks", Style: "tasks.action"}},
 		{{Text: "Patch cache", Style: "tasks.title"}},
@@ -200,7 +277,7 @@ func drawnKeys(t *testing.T) (used, unknown map[string]bool) {
 	// The effort slider lives in internal/app and renders via EffortWidget, which
 	// this package cannot import. Its keys are proven by collecting literal spans
 	// that name every declared effort.* key.
-	collect([]Line{
+	collect("literal:effort", []Line{
 		{{Text: "Faster", Style: "effort.label"}, {Text: "─", Style: "effort.track"}, {Text: "●", Style: "effort.marker"}},
 		{{Text: "low", Style: "effort.level"}, {Text: "high", Style: "effort.selected"}},
 		{{Text: "m", Style: "effort.fill.medium"}, {Text: "h", Style: "effort.fill.high"}, {Text: "x", Style: "effort.fill.xhigh"}},
@@ -209,7 +286,7 @@ func drawnKeys(t *testing.T) (used, unknown map[string]bool) {
 		{{Text: "r", Style: "effort.rainbow.r"}, {Text: "o", Style: "effort.rainbow.ro"}, {Text: "o", Style: "effort.rainbow.o"}, {Text: "y", Style: "effort.rainbow.oy"}, {Text: "y", Style: "effort.rainbow.y"}, {Text: "g", Style: "effort.rainbow.yg"}, {Text: "g", Style: "effort.rainbow.g"}, {Text: "b", Style: "effort.rainbow.gb"}, {Text: "b", Style: "effort.rainbow.b"}, {Text: "p", Style: "effort.rainbow.bp"}, {Text: "p", Style: "effort.rainbow.p"}, {Text: "r", Style: "effort.rainbow.pr"}},
 		{{Text: "d", Style: "effort.ultra.deep"}, {Text: "m", Style: "effort.ultra.deepMid"}, {Text: "m", Style: "effort.ultra.mid"}, {Text: "b", Style: "effort.ultra.midBright"}, {Text: "b", Style: "effort.ultra.bright"}},
 	})
-	return used, unknown
+	return used, unknown, owners
 }
 
 // editWithDiff is an edit carrying every row a diff can hold: the three operations,
@@ -237,20 +314,31 @@ func editWithDiff() state.Item {
 	}
 }
 
+// theRecapItems is a finished turn for the recap widget to summarize: the reader's
+// prompt, a tool call over it and the answer, which is what recapText counts.
+var theRecapItems = []state.Item{
+	{Kind: state.KindPrompt, Text: "clean up the cache"},
+	{Kind: state.KindTool, ID: "t1", Tool: "read"},
+	{Kind: state.KindText, Text: "Cache cleared."},
+}
+
 // TestNoUndeclaredStyleKeyIsDrawn fails on a key the renderer invented. Such a key
 // silently resolves to no styling, which is the worst possible outcome: it looks
 // like a theme bug and it cannot be fixed from a theme.
 func TestNoUndeclaredStyleKeyIsDrawn(t *testing.T) {
-	_, unknown := drawnKeys(t)
+	_, unknown, owners := drawnKeys(t)
 	if len(unknown) == 0 {
 		return
 	}
-	t.Fatalf("the renderer drew style keys that ui.Keys does not declare: %v", sortedSet(unknown))
+	for _, key := range sortedSet(unknown) {
+		t.Errorf("the renderer drew style key %s, which ui.Keys does not declare; the sources that drew it: %v",
+			key, sortedSet(owners[key]))
+	}
 }
 
 // TestEveryDeclaredKeyIsDrawn keeps `theme keys` honest in the other direction.
 func TestEveryDeclaredKeyIsDrawn(t *testing.T) {
-	used, _ := drawnKeys(t)
+	used, _, _ := drawnKeys(t)
 	for _, d := range Keys {
 		_, exempt := notYetDrawn[d.Key]
 		switch {

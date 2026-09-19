@@ -29,7 +29,16 @@ type Block interface {
 // ItemBlock renders one state.Item. One type with a switch rather than one type
 // per kind: the kinds share all their layout decisions (marker, wrap, hanging
 // indent) and differ only in which style keys they name.
-type ItemBlock struct{ It state.Item }
+//
+// Detail is the output level the block draws at. It is a field and not a Render
+// parameter because BlockFor hands back the Block interface a renderer's cache
+// stores, and the level belongs to the drawing rather than to the item; a zero
+// value means the standard level, which is what a caller that never heard of the
+// levels has always been shown.
+type ItemBlock struct {
+	It     state.Item
+	Detail DetailLevel
+}
 
 // BlockFor wraps an item.
 func BlockFor(it state.Item) Block { return ItemBlock{It: it} }
@@ -42,18 +51,37 @@ func (b ItemBlock) Render(width int, g Glyphs) []Line {
 	if width <= 0 {
 		return nil
 	}
+	detail := b.Detail.OrStandard()
 	switch b.It.Kind {
 	case state.KindPrompt:
 		return banded(g.Span("prompt.marker", "prompt.marker"), b.It.Text, "prompt.text", "prompt.band", width)
 	case state.KindThinking:
-		if b.It.Open {
+		// While a thought is open the compact and standard levels agree: both draw the
+		// same one line, a "Thinking ·" label and the tail of the text so far. The tail
+		// is the whole animation — every delta pushes the line left and the oldest words
+		// fall off the left edge — so the fold doubles as the sign of life, the way a
+		// working verb would. Full is the opposite answer for the same item: the text
+		// was kept in state for exactly this, so it streams expanded there, and a
+		// finished thought draws what it said at full too. At the standard level the
+		// finished thought collapses back to one line saying how long it took, and the
+		// compact level keeps it out of the way entirely.
+		if b.It.Open && detail != DetailFull {
+			return b.thinkingMarquee(width, g)
+		}
+		if detail == DetailCompact {
+			return nil
+		}
+		if b.It.Open || detail == DetailFull {
 			return marked(g.Span("thinking.marker", "thinking.marker"), b.It.Text, "thinking.text", width)
 		}
 		return marked(g.Span("thinking.marker", "thinking.marker"), b.thoughtSummary(), "thinking.summary", width)
 	case state.KindText:
 		return RenderMarkdown(b.It.Text, width, g)
 	case state.KindTool:
-		return b.renderTool(width, g)
+		if detail == DetailCompact {
+			return b.renderToolCompact(width, g)
+		}
+		return b.renderTool(width, detail, g)
 	case state.KindNotice:
 		style := "notice.text"
 		switch b.It.Notice {
@@ -127,12 +155,53 @@ func join(prefix, tail Line) Line {
 	return append(append(Line{}, prefix...), tail...).TrimRight()
 }
 
-// thoughtSummary is what replaces a finished reasoning block. The interesting
-// number is how long the model spent, not what it said; the text stays in state
-// so ctrl+o can still show it.
+// thinkingMarquee draws an open reasoning block as the one line the fold shows:
+//
+//	Thinking · how the session cookie is re-read before the token is rotated
+//
+// The text is drawn from its tail, never wrapped: each delta extends the tail and
+// pushes what was visible leftward past the label, so the line reads as a strip of
+// thought scrolling off to the left — an indicator of work and a fold at once. The
+// walk is forward from the front, dropping one rune's width at a time, so a long
+// thought costs one pass rather than a re-measure per rune.
+func (b ItemBlock) thinkingMarquee(width int, g Glyphs) []Line {
+	head := Line{{Text: "Thinking · ", Style: "thinking.marker"}}
+	w := head.Width()
+	room := width - w
+	if room <= 0 {
+		return nil
+	}
+	runes := []rune(b.It.Text)
+	start, sw := 0, ansi.StringWidth(b.It.Text)
+	for sw > room && start < len(runes) {
+		sw -= ansi.StringWidth(string(runes[start]))
+		start++
+	}
+	// A one-line indicator never ends in a space and carries no control character:
+	// the tail is stripped and trimmed, and a thought whose tail is empty — the delta
+	// before the first word — trims the label too. A newline inside the window becomes
+	// a space rather than being dropped, so the words it separated stay two words.
+	tail := strings.ReplaceAll(string(runes[start:]), "\n", " ")
+	tail = strings.TrimRight(stripControls(tail), " ")
+	label := head
+	if tail == "" {
+		label[0].Text = strings.TrimRight(label[0].Text, " ")
+	}
+	return []Line{join(label, Line{{Text: tail, Style: "thinking.text"}})}
+}
+
+// thoughtSummary is what replaces a finished reasoning block at the standard level.
+// The interesting number is how long the model spent, not what it said; the text
+// stays in state so the full level — and nothing less than a rendering decision —
+// can still show it. A short thought reads as "a few seconds" rather than a decimal
+// of a second the reader never needed precision on.
 func (b ItemBlock) thoughtSummary() string {
 	d := b.It.EndedAt - b.It.StartedAt
-	s := "Thought for " + fmtDuration(d)
+	took := fmtDuration(d)
+	if d < 10*time.Second {
+		took = "a few seconds"
+	}
+	s := "Thought · " + took
 	if b.It.Effort != "" {
 		s += " (" + b.It.Effort + " effort)"
 	}
@@ -147,7 +216,7 @@ func (b ItemBlock) thoughtSummary() string {
 // The marker carries the status, which is why there are four marker keys and one
 // name key: colour is the only thing that distinguishes a call that is running
 // from one that failed, and it belongs on the smallest glyph on the line.
-func (b ItemBlock) renderTool(width int, g Glyphs) []Line {
+func (b ItemBlock) renderTool(width int, detail DetailLevel, g Glyphs) []Line {
 	marker := "tool.marker.pending"
 	switch b.It.Status {
 	case state.ToolOK:
@@ -178,11 +247,71 @@ func (b ItemBlock) renderTool(width int, g Glyphs) []Line {
 	if b.It.Summary == "" && b.It.Diff == nil {
 		return out
 	}
-	out = append(out, b.resultLines(width, w, g)...)
+	out = append(out, b.resultLines(width, w, detail, g)...)
 	// The diff is assembled by renderDiff and appended untouched: join trims
 	// trailing spaces, which is right for a sentence and wrong for a row whose
 	// coloured band is made of them.
 	return append(out, renderDiff(b.It.Diff, width, g)...)
+}
+
+// renderToolCompact draws the whole of a call in the compact level's one row:
+//
+//	● Update(cmd/arxi/log.go) +27 -6
+//	● Bash(go test -run Since ./internal/logstore) Failed
+//
+// The call is the line the standard level already draws — the name and the arguments
+// are what a reader scans for — so the whole level is spent on the outcome, reduced
+// to the smallest thing that is still a fact: a diff's two counts, or one word for
+// the statuses that have no diff to count. A success with nothing to count draws the
+// call and stops, and a result's summary and hunks draw no rows at all — those are
+// the rows this level exists to save, and none of them is more than a ctrl+o away.
+//
+// A side of the count that would say zero is dropped, for the same reason Diff.
+// Summary drops its clause: "+0 -6" spends four columns saying the edit did nothing
+// on one side, and the eye reading a pair of counts assumes a pair of numbers.
+func (b ItemBlock) renderToolCompact(width int, g Glyphs) []Line {
+	marker := "tool.marker.pending"
+	switch b.It.Status {
+	case state.ToolOK:
+		marker = "tool.marker.ok"
+	case state.ToolFailed:
+		marker = "tool.marker.error"
+	case state.ToolDenied:
+		marker = "tool.marker.denied"
+	}
+	head := Line{g.Span("tool.marker", marker)}
+	w := head.Width()
+	if w >= width {
+		return nil
+	}
+	call := []Span{
+		{Text: displayTool(b.It.Tool), Style: "tool.name"},
+		{Text: "(" + formatArgs(b.It.Args) + ")", Style: "tool.args"},
+	}
+	switch b.It.Status {
+	case state.ToolFailed:
+		call = append(call, Span{Text: " Failed", Style: "tool.status.error"})
+	case state.ToolDenied:
+		call = append(call, Span{Text: " Denied", Style: "tool.status.denied"})
+	}
+	if b.It.Status == state.ToolOK && b.It.Diff != nil {
+		if b.It.Diff.Added > 0 {
+			call = append(call, Span{Text: " +" + strconv.Itoa(b.It.Diff.Added), Style: "tool.count.add"})
+		}
+		if b.It.Diff.Removed > 0 {
+			call = append(call, Span{Text: " -" + strconv.Itoa(b.It.Diff.Removed), Style: "tool.count.del"})
+		}
+	}
+	cont := Line{{Text: strings.Repeat(" ", w)}}
+	var out []Line
+	for i, ln := range WrapSpans(call, width-w, nil) {
+		p := head
+		if i > 0 {
+			p = cont
+		}
+		out = append(out, join(p, ln))
+	}
+	return out
 }
 
 // A long result is elided rather than drawn whole: resultHead lines from its top,
@@ -198,6 +327,10 @@ func (b ItemBlock) renderTool(width int, g Glyphs) []Line {
 // that changes with the width of their window. It is not measured in bytes either.
 // Bytes are what max_output_bytes caps upstream, which is a fact about the runtime's
 // budget rather than about what a screen can show.
+//
+// The full level is the exception that keeps the rule honest: the summary was never
+// thrown away, only folded, so the level that promises everything draws it whole and
+// needs neither the head nor the tail budget.
 const (
 	resultHead = 3
 	resultTail = 8
@@ -211,7 +344,7 @@ const (
 //	  ok    arxi.local/sim/internal/scenario 0.011s
 //	  … 19 more lines
 //	  --- FAIL: TestGapIsDrawnBetweenHunksOnly (0.00s)
-func (b ItemBlock) resultLines(width, indent int, g Glyphs) []Line {
+func (b ItemBlock) resultLines(width, indent int, detail DetailLevel, g Glyphs) []Line {
 	if b.It.Summary == "" {
 		return nil
 	}
@@ -250,7 +383,7 @@ func (b ItemBlock) resultLines(width, indent int, g Glyphs) []Line {
 	// The threshold is head+tail+1 and not head+tail because eliding one line spends a
 	// row to save a row. Above it the count is always at least two, which is why nothing
 	// below writes a singular: an unreachable branch is a lie a test cannot catch.
-	if len(lines) <= resultHead+resultTail+1 {
+	if detail == DetailFull || len(lines) <= resultHead+resultTail+1 {
 		add(b.It.Summary, style)
 		return out
 	}

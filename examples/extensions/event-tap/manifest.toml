@@ -1,0 +1,5 @@
+name = "event-tap"
+version = "1.0.0"
+protocol = "ext/v1"
+executable = "bin/event-tap"
+capabilities = ["events.subscribe"]

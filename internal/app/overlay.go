@@ -235,6 +235,18 @@ func (ew EffortWidget) Animated() bool {
 	return ew.Slider.Selected >= 4 // max or ultracode
 }
 
+// NextVisualChange follows the Phase/2 cadence used to color the selected label.
+func (ew EffortWidget) NextVisualChange() int {
+	if !ew.Animated() {
+		return 0
+	}
+	phase := ew.Slider.Phase % 2
+	if phase < 0 {
+		phase += 2
+	}
+	return 2 - phase
+}
+
 // Render draws a vertical effort selector. On short surfaces it keeps a window
 // around the selected level; on very narrow ones the option rows are the entire UI.
 func (ew EffortWidget) Render(w, h int, g ui.Glyphs) []ui.Line {

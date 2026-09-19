@@ -1,0 +1,24 @@
+❯ document it                                                                   
+
+• both spellings, with a table of the forms worth copying
+• that d is ours rather than Go's
+• that a bare date is midnight in your zone and not UTC, which is the line most
+  likely to save somebody an hour
+• what an empty window does under --follow, quoting the stderr line exactly
+
+│ $ arxi log --run r8 --since 30m --follow
+│ no events at or after 2026-09-03T15:12:44Z; waiting
+
+Four prompts, four green suites, and the flag is done: parsed, filtered,
+followed and written down.
+
+· no pending effects: builder documented --since in docs/cli.md and the suite is
+  green; stage "execute" advances when all members submit, and builder has not
+  submitted
+
+╭──────────────────────────────────────────────────────────────────────────────╮
+│ ❯ ask anything, or / for commands                                            │
+╰──────────────────────────────────────────────────────────────────────────────╯
+ · end of scenario — the input bar is yours, ctrl+d to leave
+ waiting · builder · $1.30 of $5.00 · turn 16 · 31.6k in · 398 out
+ claude-opus-5

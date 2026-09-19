@@ -1,0 +1,1 @@
+{"valid":true,"direction":"extension","envelope":{"type":"view.update","payload":{"id":"main","width":10,"height":2,"rows":[{"id":"r1","spans":[{"text":"hello","role":"text"}]}]}}}

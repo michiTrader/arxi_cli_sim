@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"math"
 	"strings"
 
 	"github.com/charmbracelet/x/ansi"
@@ -361,8 +362,44 @@ func (s Shimmer) Slower(n int) Shimmer {
 		return s
 	}
 	s = s.norm()
+	if s.Period > math.MaxInt/n {
+		s.Period = math.MaxInt
+		return s
+	}
 	s.Period *= n
 	return s
+}
+
+// LongerRest returns s with n times its existing dark rest and the same visible pass.
+// Unlike Slower it scales Period-Travel rather than the complete period, which makes
+// repeated cadence adjustments compose without lengthening the sweep itself.
+func (s Shimmer) LongerRest(n int) Shimmer {
+	if !s.On() || n <= 1 {
+		return s
+	}
+	s = s.norm()
+	rest := s.Period - s.Travel
+	if rest > (math.MaxInt-s.Travel)/n {
+		s.Period = math.MaxInt
+		return s
+	}
+	s.Period = s.Travel + n*rest
+	return s
+}
+
+// NextVisualChange reports how many shared ticks may pass before this shimmer can
+// draw a different frame. The moving pass changes every tick; the dark rest sleeps
+// until the next pass begins. Zero means the shimmer is off.
+func (s Shimmer) NextVisualChange() int {
+	if !s.On() {
+		return 0
+	}
+	s = s.norm()
+	t := ((s.Phase % s.Period) + s.Period) % s.Period
+	if t < s.Travel {
+		return 1
+	}
+	return s.Period - t
 }
 
 // cutCols splits s at the first grapheme boundary at or after n columns, so that head is

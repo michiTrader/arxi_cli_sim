@@ -82,11 +82,26 @@ type Emitter struct {
 	// on by itself.
 	Mouse bool
 
+	// Scrollback says the reader scrolls this surface with the terminal's own history, so the
+	// transcript is written into scrollback as the window leaves it behind instead of being
+	// held for the handover. It is a property of the phone's surface, set by the caller whose
+	// platform policy owns it; the frames decide when it may act, because a frame painted over
+	// the interface by another view is not the transcript and says nothing about where history
+	// ends. See Emit for the guards.
+	Scrollback bool
+
 	committed int  // committed lines already flushed to the user's history, as a high-water mark
 	claimed   bool // a surface is taken and every row on it is ours: the alternate buffer, or the screen
 	rows      int  // how many rows the last frame painted, which is the screen's height
 	started   bool
 	pushed    bool // an entry of ours is on the terminal's keyboard stack, and only we may pop it
+
+	// screenTop is the transcript row the screen's top line is holding, and painted says one
+	// stream frame has been painted at all. Until that first paint nothing can be committed,
+	// whatever a frame's offset claims: rows the screen never showed are the handover's debt
+	// and not a scroll's.
+	screenTop int
+	painted   bool
 }
 
 // modeAlternateScroll is DECSET 1007: the terminal's own translation of a wheel notch into
@@ -128,15 +143,13 @@ const modeAlternateScroll = ansi.DECMode(1007)
 // shift, and it is a flag and not a config setting for the same reason -ascii is: it is a fact
 // about the terminal in front of the person, not a taste.
 //
-// Every clause of that trade assumes a pointer, and on a phone none of them hold — which is
-// why the caller, and not this file, decides: term.IsTermux is asked, and Mouse is turned on
-// under Android before the first frame. A finger has no drag to lose, because Termux selects
-// with a long press and its own handles and never asks a program's permission for it; and the
-// 1007 above is a mode Termux does not implement, so an unclaimed swipe is not a notch that
-// does nothing, it is arrow keys — the ones a reader would have pressed, byte for byte, so
-// nothing here or in term.Decode can tell a swipe from a press of up, and the input's history
-// walks under a thumb that asked to scroll. Tracking is the only fix that exists there, and it
-// costs a phone nothing at all. -mouse=false is still the way to say otherwise.
+// A phone adds a fourth claimant: Android's soft keyboard. With tracking enabled, Termux
+// encodes a tap as a mouse report for the program instead of using it to show the keyboard.
+// No terminal sequence can ask Android to restore the IME after that choice has been made, so
+// the caller takes the main screen there and leaves Mouse off: on the alternate screen a
+// released swipe has nowhere to go but the shell's history, while on the main screen the
+// transcript is the scrollback a swipe moves anyway. An explicit -alt, -mouse or [scroll]
+// setting can still choose either side of the trade.
 //
 // Button events and not any-motion (CSI ? 1003 h) when tracking is asked for, which would
 // report every bare mouse move across the pane and buy nothing this needs.
@@ -281,6 +294,17 @@ func (e *Emitter) Exit() []byte {
 // CSI 2 J, CSI 3 J and RIS are never sent, in either mode — erasing each row we are about
 // to own reaches every cell those would and not one cell more, without taking history that
 // is not ours.
+//
+// Scrollback is the one exception, and it is a surface asking rather than this algorithm
+// changing sides. A phone has no wheel and no drag: the reader scrolls the terminal's own
+// history, and history that never receives the transcript has nothing to scroll. There the
+// window rides the tail, and every row it leaves behind is scrolled into history as it
+// leaves, under the guards in Emit. The cost the no-commit rule exists for — a reflow
+// re-wrapping rows we can no longer reach — is one a phone almost never pays: its width
+// changes when the device is turned, its height when the keyboard comes and goes, and a
+// height change re-rows nothing. The handover still owes the complement: the scrolls
+// advanced the same high-water mark the handover prints from, so the transcript reaches the
+// terminal once, half by scroll and half by handover, in order.
 func (e *Emitter) Emit(f Frame) []byte {
 	// A frame with no height is a document rather than a screen — the last frame of a
 	// session, a fold, a pipe — and a frame carrying rows we have not written yet has to
@@ -296,7 +320,25 @@ func (e *Emitter) Emit(f Frame) []byte {
 	if !e.claimed {
 		e.claim(&b, f)
 	}
+	// The scrollback commit, and the guards that keep it honest. A scroll is the only way a
+	// row enters the terminal's history, and a scroll carries whatever the screen's top row is
+	// holding; so the rows it commits run from the high-water mark down only when the screen's
+	// top row IS the high-water mark, and this frame is part of the stream. Scrolling first
+	// and painting second is what keeps that true afterwards: the paint covers the blank foot
+	// the scroll leaves, and the screen's top becomes the window's new first row, which the
+	// frame states in writing. A frame from another view moves neither number, so a config
+	// editor or a roster can paint over the interface and the stream resumes where it stopped.
+	if f.Scrollback && e.painted && f.Scroll.Below == 0 && e.screenTop == e.committed {
+		if n := f.Scroll.Above - e.committed; n > 0 {
+			b.WriteString(ansi.CursorPosition(1, f.Height))
+			b.WriteString(strings.Repeat("\n", n))
+			e.committed = f.Scroll.Above
+		}
+	}
 	e.paintScreen(&b, f)
+	if f.Scrollback {
+		e.screenTop, e.painted = f.Scroll.Above, true
+	}
 	b.WriteString(ansi.ResetMode(ansi.ModeSynchronizedOutput))
 	return []byte(b.String())
 }
@@ -431,6 +473,7 @@ func (e *Emitter) handOver(f Frame) []byte {
 	b.WriteString(ansi.SetMode(ansi.ModeTextCursorEnable))
 	b.WriteString(ansi.ResetMode(ansi.ModeSynchronizedOutput))
 	e.rows = 0
+	e.screenTop, e.painted = 0, false
 	return []byte(b.String())
 }
 

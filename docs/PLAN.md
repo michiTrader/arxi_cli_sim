@@ -17,7 +17,7 @@ and an interface you can choose.
 
 | #  | Asked for                                        | Verdict |
 |----|--------------------------------------------------|---------|
-| 1  | `Thought for 0.5s (high effort)` with no `✻`      | **done** |
+| 1  | `Thought · 0.5s (high effort)` with no `✻`        | **done**; an open thought now reads as a one-line `Thinking · …` marquee at levels 1 and 2 |
 | 2  | shift+enter / ctrl+enter for a second line         | **done**; ctrl+enter starts a row on this terminal today |
 | 3  | plain up/down = input history                     | **done**, on the plain arrows; the scroll went to the keyboard |
 | 4  | your message pinned on top while scrolling        | **done**, while scrolled only; a page key pays for its rows |
@@ -30,7 +30,7 @@ and an interface you can choose.
 | —  | a plain drag to select, with no shift             | **done**: the mouse is released on a desktop; `-mouse` claims it back |
 | —  | a config file: `[keys]`, `[glyphs]`, `[styles]`   | **done**: `-config`, the default path, and `check` on a `.toml` |
 | —  | ctrl+c clears the line; twice, or ctrl+d, leaves  | **done**: `ActionInterrupt`, and the second press is the door |
-| —  | a swipe on Termux scrolls, not walks the history  | **done**: the mouse is claimed there, one row per report |
+| —  | a swipe on Termux scrolls, not walks the history  | **done**, then reversed twice, 2026-09: the run is on the alternate screen everywhere and the released swipe scrolls through the plain arrows; see the reversal below |
 | —  | lime, light indigo and fuchsia in the code        | **done**, six named colours; a number is amber, a comment slate |
 | —  | the two bottom rows off the edge of the terminal  | **done**: `bottomMargin = 1`, spent before the text is fitted |
 | —  | a light sweeping the input bar while you idle     | **done**, and the verb too: `ui.Shimmer`, `-shine=false` stops it |
@@ -352,6 +352,85 @@ the machine's environment, and by 5 mutations under `python3 tools/mut.py termux
 `TestTheMouseIsTheReadersUnlessAskedFor` and `WheelLines: 1` is arithmetic `app_test.go` already
 does. **The remaining oracle is your own swipe**, on the phone, because it is the only thing that can
 say whether the finger now carries the conversation.
+
+**Reversed on the phone, 2026-09: the oracle came back both ways.** Run on the phone, the claim
+cost the keyboard: with tracking up, a tap reaches the program as a mouse report and Termux
+never shows the soft keyboard again — whatever the handler chain does, the observed contract is
+that the tap the IME needs is consumed by the report — so hiding the keyboard meant killing the
+run to type again. Releasing the mouse on the *alternate* buffer did not give the swipe to the
+conversation either: there the scrollback is the shell's own history, and a swipe moved that.
+The decision that replaces this one: **on Termux the run takes the main screen and releases
+the mouse** — `inlineFor` in `cmd/arxi-sim` flips the surface default, `-alt` takes the old one
+back — because on the main screen the scrollback *is* the conversation: a swipe is Termux's own
+scroll moving the transcript, and a tap is a tap. The wheel arrangement above survives behind
+`-alt`, for a phone with a mouse attached, and `-mouse=false` inside it hands the tap back.
+`-scroll` 1 stands for that tracked case. `IsTermux` is unchanged, one question with one caller.
+
+**And the scroll that remained, 2026-09: the transcript now streams into the history.**
+Flipping the surface fixed the tap, but a swipe still moved the shell's history, because the
+no-commit rule — every visible row repainted in place, nothing entering history before the
+handover — leaves a phone's scrollback empty of the conversation. So `Emitter.Scrollback`,
+set by the same platform policy that flips the surface, commits as it goes: the window rides
+the tail, every row it leaves behind is one newline-scroll into history, and the handover
+prints only the complement, so the transcript arrives once, in order, half by scroll and
+half by handover. The rules that made the no-commit design safe are what the stream gives
+up, on one surface, on purpose. The window's top never retreats — a row history holds cannot
+be re-shown, which is why the view keys stand down there and the swipe is the scroll. A
+width change re-wraps rows no erase can reach — on a phone that is turning the device, not
+typing. And a frame from another view lays a seam first, because a scroll carries whatever
+the screen's top is holding, and after a roster or a consent that is not the transcript.
+The guards live in `Emit`, held by the two scrollback tests in `emit_test.go`, the window
+rules and the trim in `render_test.go`, and the app's stand-down and seam in `app_test.go`;
+the oracle that matters is still the phone.
+
+**Reversed again on the phone, 2026-09-12: the alternate screen everywhere.** The streaming
+arrangement broke at the one key that changes how much of the transcript shows. ctrl+o
+re-wraps the whole conversation — the same items are different row counts at each level —
+and on the main screen the rows the window had already left behind sat in history drawn at
+the *old* level: no erase of ours reaches history, so the screen stood split, the level you
+left above the window and the level you chose below it, for the rest of the run. The
+repaint itself arrived in pieces too, because a frame's atomicity is synchronized output
+(`?2026`), which Termux does not honour — Windows Terminal does, which is why the same
+keypress never tore there. So `inlineFor` no longer asks the platform: with no flag typed,
+every run takes the alternate screen, where nothing is committed before the handover and
+every frame repaints rows 1..height in place. The tap the first reversal bought is bought
+differently now: `mouseFor` releases the mouse on Termux on *both* surfaces, so a tap is
+still a tap, and the swipe an unclaimed terminal synthesizes arrives as the plain arrows —
+the input history — which is the shape a desktop reader already knows. The scrollback
+stream stands down with the surface: `Scrollback` is still `o.inline && isTermux`, and
+`-inline` is now the only way onto the main screen, carrying everything the two entries
+above record as its price. `-scroll` 1 stands, for the tracked case and the notch. The
+oracle left is the phone again: ctrl+o through the three levels, clean.
+
+**And the swipe came back the same day, 2026-09-12: the plain arrows are the scroll.**
+Releasing the mouse on the alternate screen gave the tap back and took the last scroll
+channel with it — the first oracle walk on the rebuilt surface found the finger moving
+nothing, because an unclaimed swipe there is Termux's own synthesis of the plain arrow
+keys, and the arrows meant the input history. The fix claims no mouse and forks no table:
+`play` layers a platform default under the config's `[keys]` (`platformKeys`), and while a
+phone's mouse is released its plain arrows mean `scroll-up`/`scroll-down`, one row a
+report — the grain the tracked wheel had. The history keeps `ctrl+p`/`ctrl+n`, `-mouse`
+hands the arrows back with the wheel it buys, and the slash menu joins the effort slider
+and the config view in reading the scroll actions as movement.
+
+**The phone arrangement — read this before touching any of it.** Four defaults hang
+together on Termux, and twice in one month a fix to one has broken another:
+  1. **the surface is the alternate screen** (`inlineFor`) — the streaming main screen
+     cannot survive a level change, and it is the only surface where the swipe is Termux's
+     own scroll;
+  2. **the mouse is released** (`mouseFor`) — a claimed tap is the soft keyboard never
+     coming back, on either surface;
+  3. **while released, the plain arrows scroll** (`platformKeys`) — the swipe has no other
+     channel on a terminal with no 1007, and if the arrows mean "history" the conversation
+     has no scroll at all;
+  4. **the notch is one row** (`scrollFor`) — a report, or a synthesized arrow, is the row
+     it stands for.
+Each is a default layered in `play`, each overridable — `-inline`, `-mouse`, `[keys]`,
+`-scroll` — and none is safe to change without walking the set: the swipe fix broke the
+keyboard, the keyboard fix broke the swipe, and the surface fix broke ctrl+o.
+`TestTheTermuxArrangement` in `cmd/arxi-sim` fails when the four drift apart. The oracle,
+in order, on the phone: a tap shows the keyboard; a swipe moves the conversation; ctrl+o
+through the three levels repaints clean; ctrl+p/ctrl+n walk the input history.
 
 **And the code palette is the one you pointed at, in six named colours.** You sent a screenshot
 of Claude Code's own picker at Monokai Extended and asked for three substitutions by name: lime
@@ -792,6 +871,12 @@ folding, complete-frame Team geometry and input isolation, responsive informatio
 vertical selector. The new focused mutation families and full repository sweep are the remaining
 automated gate; desktop and Termux playback remain the required human oracle for interaction.
 
+## Phase 4 — local extension distribution
+
+**Complete for the delivered local distribution scope.** `arxi-sim extensions list` provides a deterministic read-only inventory without constructing the orchestrator, and `extensions install <directory> [--yes]` preflights, warns, confirms, commits an immutable content-addressed generation, and atomically registers it with empty runtime consent. Shared package identity/digest APIs define both installer and runtime/list verification. Focused command and installer tests cover confirmation, registration, collision, state reporting, rollback seams, and portable paths. The stdlib examples now use explicit relative staged executables and include an ext/v2 panel.
+
+This completion does not claim update, uninstall, or generation archival. WASM and an upstream manifest mapping remain a deferred decision until executable selection, authority/sandboxing, portability, and content-identity criteria are specified.
+
 ## Next
 
 The automated implementation gate for Team, Tasks, and Config is complete. The remaining oracle is
@@ -861,12 +946,16 @@ which is why the ladder in the table below is not a convenience but the whole of
 | `shift+↑` / `shift+↓` | the conversation, to your own previous or next turn |
 | `pgup` / `pgdown`, `ctrl+home` / `ctrl+end` | a screen, and the two ends |
 
-On Termux read the wheel row as a swipe and take the `-mouse` out of it: the trade is turned around
-there because a released mouse hands a finger's travel to the program as `↑`/`↓` themselves, so a
-notch is a swipe, a report is one row, and the two `ctrl` rows collapse onto the two `alt` rows
-because `-scroll` is 1. The ramp is off there for the same reason: at one row a report the swipe is
-already the hand's own measurement of itself, and multiplying it takes the text off the thumb.
-*And on Termux the mouse is claimed* above is the whole of the argument.
+On Termux the default run is on the alternate screen like anywhere else — see the reversal
+at *Reversed again on the phone* above — and the mouse is released there, so an unclaimed
+swipe arrives as the plain arrows and the platform key layer gives them to the scroll
+actions: one row a report, the grain the tracked wheel had, with the input history on
+`ctrl+p`/`ctrl+n`. `-mouse` takes the swipe as a tracked wheel, one row a report, hands
+the arrows back to the history, and then the two `ctrl` rows collapse onto the two `alt`
+rows because `-scroll` is 1. The ramp is off there for the same reason: at one row a report
+the swipe is already the hand's own measurement of itself, and multiplying it takes the
+text off the thumb. `-inline` is the one surface where the swipe is Termux's own scroll,
+and the view keys stand down with it.
 
 The jump pair is `jump-prev-message`/`jump-next-message`, and it is on `shift` rather than on
 `ctrl+shift` because you reported that `ctrl+shift+↑` never reached the program at all — that
@@ -943,9 +1032,12 @@ arrows are the app's under either mode, and the wheel was the only thing left to
 No keymap change is needed to move between them, which is the point of binding `wheelup` in a
 build that cannot receive it. C is still unbuilt and still the only way to have all three.
 
-**Except on Termux, where D is A**, and that is the exception the four doors did not anticipate: they
-were all reasoned from a terminal that has a pointer and implements 1007, and a phone has neither. The
-choice is made once, in `play`, by `term.IsTermux()`, and it is a default rather than a policy.
+**Except on Termux, where D was A** — the exception the four doors did not anticipate, all of
+them reasoned from a terminal that has a pointer and implements 1007, and a phone has neither.
+Reversed on 2026-09-12 (*Reversed again on the phone* above): D ships on the phone too, with
+`mouseFor` releasing the mouse instead of claiming it, and `term.IsTermux()` now settles only
+the phone defaults — the mouse, the notch, the plain arrows, and whether an explicit
+`-inline` streams.
 
 ## Not ours: ctrl+wheel to resize (demand 5)
 
@@ -1033,7 +1125,11 @@ price to accept, and it is a decision rather than a discovery.
    held by one `armed` flag that `key` clears for every other keypress, and by the on-screen row
    that is the promise instead of a timer.
 5. ~~A swipe on Termux scrolls the conversation instead of walking the input history.~~ **Done**,
-   by claiming the mouse there and setting `-scroll` to 1; your own swipe is the oracle left.
+   then reversed 2026-09-12 and done again the same day: claiming the mouse cost the tap and
+   streaming the transcript cost ctrl+o, so the run is on the alternate screen with the mouse
+   released — and the released swipe, which arrives as the plain arrows, scrolls through them
+   while the history keeps `ctrl+p`/`ctrl+n`; `-mouse` and `-inline` each buy another
+   arrangement at their own price.
 6. ~~A light sweeping the input frame while it is your turn, and the word `working` while it is
    not.~~ **Done**, as a value a caller arms rather than a widget: `ui.Shimmer`, a ladder of
    theme keys for the falloff, `App.phase` as the one clock, and `-shine=false` to stop it.

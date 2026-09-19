@@ -1,5 +1,6 @@
-// Package config reads the file the program has been advertising: six flat tables that
-// rename a key, redraw a glyph, recolour a span, set a number or turn an animation off.
+// Package config reads the file the program has been advertising: flat tables that
+// rename a key, redraw a glyph, recolour a span, set a number, turn an animation off,
+// pick a theme pack or reorder the chrome.
 //
 // It is not a TOML implementation, and the .toml name is a promise about the shape rather
 // than the grammar: [section] headers, one `key = "value"` per line, # comments, and
@@ -11,10 +12,10 @@
 // both are accepted here.
 //
 // The vocabularies are not in this package. Every name a config may write is declared by
-// whoever owns it — app.ActionKeys, ui.GlyphKeys, ui.Keys, term.ParseKey — and this reader
-// checks membership against those tables and then hands the maps to their real
-// constructors, which keep the last word. The check is duplicated so that an error can name
-// a line number. The lists never are.
+// whoever owns it — app.ActionKeys, ui.GlyphKeys, ui.Keys, app.CompositionWidgets,
+// term.ParseKey — and this reader checks membership against those tables and then hands
+// the maps to their real constructors, which keep the last word. The check is duplicated
+// so that an error can name a line number. The lists never are.
 //
 // Every problem in a file is reported rather than the first, which is the rule
 // internal/scenario keeps and for the same reason: a config with three typos in it should
@@ -33,6 +34,7 @@ import (
 	"strings"
 
 	"arxi.local/sim/internal/app"
+	"arxi.local/sim/internal/ext"
 	"arxi.local/sim/internal/term"
 	"arxi.local/sim/internal/ui"
 )
@@ -53,6 +55,8 @@ var Sections = []SectionDecl{
 	{"input", `title = a word for the input box's top border`},
 	{"scroll", "lines = how far one wheel notch moves the conversation; mouse = whether to claim it"},
 	{"anim", "shine = whether the highlight sweeps at all, then period, travel and width in ticks"},
+	{"ui", `theme = the name of a theme pack to wear, from the themes dir`},
+	{"layout", "one row each: slot = ordered widget names, and slot = \"\" to leave the slot empty"},
 }
 
 func sectionList() string {
@@ -69,8 +73,22 @@ func sectionList() string {
 // A zero File is a valid config that changes nothing. That is the point of it — the program
 // builds its keymap, glyphs and theme through the three methods below whether a file was
 // found or not, so there is one path through main and not two.
+type Extension struct {
+	Name          string
+	Manifest      string
+	Enabled       bool
+	Allow         ext.CapabilitySet
+	Identity      string
+	PackageDigest string
+	Generation    int
+}
+
 type File struct {
 	Path string // "" when nothing was read
+
+	// Extensions is keyed by canonical manifest name. Manifest paths are absolute,
+	// resolved relative to this config file when written relatively.
+	Extensions map[string]Extension
 
 	Keys   map[string]app.Action // canonical key name -> action; "" removes a binding
 	Glyphs map[string]string     // glyph key -> the string to draw
@@ -82,11 +100,10 @@ type File struct {
 	InputTitle  string
 	ScrollLines int
 
-	// The two settings whose shipped default is true, and therefore the two that cannot be
-	// plain bools: a file that says nothing has to be told apart from a file that says
-	// false, and a bool answers "false" to both. A nil here means main keeps whatever the
-	// flag left, which is how `a flag beats the file beats the default` stays one rule
-	// rather than three special cases.
+	// These settings cannot be plain bools: a file that says nothing has to be told apart
+	// from a file that says false, and a bool answers "false" to both. A nil here means main
+	// keeps the runtime default, which is how `a flag beats the file beats the default` stays
+	// one rule rather than three special cases.
 	Mouse *bool
 	Shine *bool
 
@@ -95,6 +112,17 @@ type File struct {
 	// deliberately not read from the file: which theme key the band is drawn in is the
 	// program's business, and the colour is what [styles] input.shine is for.
 	Anim ui.Shimmer
+
+	// ThemeName is the theme pack [ui] asked to wear, or "" when it asked for none.
+	// The pack itself is not read here — a theme is resolved by whoever runs the
+	// program, because resolution (flag over file over nothing, and the file that
+	// must exist when a name is given) is a startup decision and not a document's.
+	ThemeName string
+
+	// Layout is [layout] as parsed: one override per row, tiers included, validated
+	// against the composition's vocabulary with line numbers. Nil when the section
+	// is absent, which is the ordinary case and the byte-identical one.
+	Layout []app.LayoutOverride
 }
 
 // Keymap is the shipped bindings with this file's laid on top.
@@ -144,7 +172,14 @@ func (f *File) Summary() string {
 			anim = append(anim, fmt.Sprintf("%s=%d", n.name, n.val))
 		}
 	}
-	return out + table("scroll", scroll) + table("anim", anim)
+	out = out + table("scroll", scroll) + table("anim", anim)
+	if f.ThemeName != "" {
+		out += fmt.Sprintf(", [ui] theme=%s", strconv.Quote(f.ThemeName))
+	}
+	if len(f.Layout) > 0 {
+		out += fmt.Sprintf(", [layout] %d", len(f.Layout))
+	}
+	return out
 }
 
 // table writes one section's worth of settings, or nothing at all when the file set none of
@@ -209,6 +244,93 @@ func LoadDefault() (*File, error) {
 	return Load(path)
 }
 
+// ThemesDir is where theme packs live when nobody names a path: the config directory
+// the operating system already has, plus arxi-sim/themes — the same portable rule
+// DefaultPath resolves by, one level down, so a reader who found their config file
+// finds their themes beside it. It answers "" when there is no home directory to ask
+// about, which LoadTheme reads as "nowhere to look".
+func ThemesDir() string {
+	dir, err := os.UserConfigDir()
+	if err != nil {
+		return ""
+	}
+	return filepath.Join(dir, "arxi-sim", "themes")
+}
+
+// LoadTheme reads the named pack from the themes dir and validates it as a theme. A
+// name is a file name without .toml and nothing more — the dir is the whole address
+// space, which is what keeps a theme from being a path someone typed into a config
+// file. A pack that is missing or invalid is an error and never a silent fall-back to
+// the shipped look: whatever named it meant it.
+func LoadTheme(name string) (*File, error) {
+	dir := ThemesDir()
+	if dir == "" {
+		return nil, fmt.Errorf("no user config directory, so nowhere to look for theme %s", strconv.Quote(name))
+	}
+	path := filepath.Join(dir, name+".toml")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("theme %s: %w", strconv.Quote(name), err)
+	}
+	f, err := ParseTheme(path, data)
+	if err != nil {
+		return nil, fmt.Errorf("theme %s: %w", strconv.Quote(name), err)
+	}
+	return f, nil
+}
+
+// ApplyTheme loads the named pack and layers it under f. It is the whole of theme
+// resolution on the file side; which name to apply — a flag's, the config's, or
+// nobody's — stays with the caller, because that ladder is a startup decision.
+func ApplyTheme(f *File, name string) (*File, error) {
+	t, err := LoadTheme(name)
+	if err != nil {
+		return nil, err
+	}
+	return f.WithTheme(t), nil
+}
+
+// WithTheme layers t under f and answers the dressed result: per key of [styles] and
+// [glyphs], and per field of [anim], f's own word stands and t fills in only what f
+// left unsaid. That order is spec/look.md's, and the reason is the config view: /config
+// edits write to the user's own file, so a theme that outranked it would make every
+// edit to a themed key a lie on screen. Partial themes are thereby legal — a pack that
+// names six keys retunes six keys.
+//
+// The result is a copy; neither input moves. Only the three tables a theme may hold
+// are merged — the role check at load keeps everything else in t zero, and this
+// function does not trust that by accident but by not looking.
+func (f *File) WithTheme(t *File) *File {
+	out := *f
+	out.Glyphs = make(map[string]string, len(f.Glyphs)+len(t.Glyphs))
+	for k, v := range t.Glyphs {
+		out.Glyphs[k] = v
+	}
+	for k, v := range f.Glyphs {
+		out.Glyphs[k] = v
+	}
+	out.Styles = make(map[string]ui.Style, len(f.Styles)+len(t.Styles))
+	for k, v := range t.Styles {
+		out.Styles[k] = v
+	}
+	for k, v := range f.Styles {
+		out.Styles[k] = v
+	}
+	if out.Anim.Period == 0 {
+		out.Anim.Period = t.Anim.Period
+	}
+	if out.Anim.Travel == 0 {
+		out.Anim.Travel = t.Anim.Travel
+	}
+	if out.Anim.Width == 0 {
+		out.Anim.Width = t.Anim.Width
+	}
+	if out.Shine == nil {
+		out.Shine = t.Shine
+	}
+	return &out
+}
+
 // Load reads a config and reports everything wrong with it at once. A missing file is an
 // error here; LoadDefault is the door for "there may not be one".
 func Load(path string) (*File, error) {
@@ -219,19 +341,41 @@ func Load(path string) (*File, error) {
 	return Parse(path, data)
 }
 
+// LoadForListing reads config syntax and extension metadata without requiring each referenced
+// manifest to load. It exists for the read-only extensions list command, which must report an
+// invalid entry rather than making one broken manifest hide every other extension.
+func LoadForListing(path string) (*File, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	return parse(path, data, false, false)
+}
+
 // Parse validates config bytes already in memory. path is only their name for diagnostics and
 // the returned File; Load remains the filesystem API and delegates here so candidate documents
 // are checked by exactly the same parser and constructors as files read at startup.
-func Parse(path string, data []byte) (*File, error) {
+func Parse(path string, data []byte) (*File, error) { return parse(path, data, false, true) }
+
+// ParseTheme validates bytes already in memory as a theme pack: the same grammar and the
+// same vocabularies, restricted to the three sections a theme may hold. A theme is not a
+// second format — it is a role the same reader already knows, which is what lets `check`
+// treat a pack as an ordinary document and this function treat it as a theme without the
+// two ever disagreeing about what a line means.
+func ParseTheme(path string, data []byte) (*File, error) { return parse(path, data, true, true) }
+
+func parse(path string, data []byte, theme, validateExtensionManifests bool) (*File, error) {
 	p := &parser{
-		path: path,
+		path:  path,
+		theme: theme,
 		f: &File{
 			Path:   path,
 			Keys:   map[string]app.Action{},
 			Glyphs: map[string]string{},
 			Styles: map[string]ui.Style{},
 		},
-		seen: map[string]int{},
+		seen:          map[string]int{},
+		extensionLine: map[string]int{},
 	}
 	sn := bufio.NewScanner(bytes.NewReader(data))
 	for p.line = 1; sn.Scan(); p.line++ {
@@ -239,6 +383,9 @@ func Parse(path string, data []byte) (*File, error) {
 	}
 	if err := sn.Err(); err != nil {
 		return nil, err
+	}
+	if len(p.problems) == 0 && validateExtensionManifests {
+		p.validateExtensions()
 	}
 	if len(p.problems) > 0 {
 		return nil, errors.Join(p.problems...)
@@ -250,16 +397,19 @@ func Parse(path string, data []byte) (*File, error) {
 }
 
 // parser is the reader's state: which section the lines are landing in, which line is being
-// read, and where each key was first set. It is a type rather than closures over locals
+// read, where each key was first set, and whether the file is being read as a theme — the
+// one role a reader has besides "config". It is a type rather than closures over locals
 // because bad and dup both need the line number and every section needs both of them.
 type parser struct {
-	path     string
-	f        *File
-	problems []error
-	line     int
-	section  string
-	skip     bool           // inside a section that was itself the error: its lines are noise
-	seen     map[string]int // "section.key" -> the line that set it
+	path          string
+	f             *File
+	problems      []error
+	line          int
+	section       string
+	skip          bool           // inside a section that was itself the error: its lines are noise
+	seen          map[string]int // "section.key" -> the line that set it
+	extensionLine map[string]int
+	theme         bool // reading as a theme pack: only taste sections are allowed
 }
 
 func (p *parser) bad(format string, a ...any) {
@@ -334,8 +484,30 @@ func (p *parser) header(text string) {
 		p.bad("%s is not a section header; want one of %s", strconv.Quote(text), sectionList())
 		return
 	}
+	if strings.HasPrefix(name, "extensions.") && !p.theme {
+		extName := strings.TrimPrefix(name, "extensions.")
+		if !validExtensionName(extName) {
+			p.bad("[%s] has an invalid extension name; want [extensions.<name>] with [a-z][a-z0-9-]{0,62}", name)
+			return
+		}
+		if _, exists := p.f.Extensions[extName]; exists {
+			p.bad("[extensions.%s] is declared twice", extName)
+			return
+		}
+		if p.f.Extensions == nil {
+			p.f.Extensions = make(map[string]Extension)
+		}
+		p.f.Extensions[extName] = Extension{Name: extName, Enabled: true, Allow: ext.NewCapabilitySet()}
+		p.extensionLine[extName] = p.line
+		p.section, p.skip = name, false
+		return
+	}
 	for _, s := range Sections {
 		if s.Name == name {
+			if p.theme && !themeHolds(name) {
+				p.bad("[%s] is not a section a theme may hold; a theme is [glyphs], [styles] and [anim], and taste is all it carries", name)
+				return
+			}
 			p.section, p.skip = name, false
 			return
 		}
@@ -343,10 +515,25 @@ func (p *parser) header(text string) {
 	p.bad("[%s] is not a section this file has; there are %s", name, sectionList())
 }
 
+// themeHolds answers whether a theme pack may hold the section. [keys] is behaviour, [ui]
+// is a selection, [input] and [scroll] are settings — none of them is taste, and a theme
+// that carried any would be a config wearing a theme's name.
+func themeHolds(name string) bool {
+	switch name {
+	case "glyphs", "styles", "anim":
+		return true
+	}
+	return false
+}
+
 // set files one setting under the section it was written in. Each of the six checks the
 // name against the table that declares it, so that the error carries a line number, and
 // stores the value for the constructor that has the final say over it.
 func (p *parser) set(key, val string) {
+	if strings.HasPrefix(p.section, "extensions.") {
+		p.setExtension(strings.TrimPrefix(p.section, "extensions."), key, val)
+		return
+	}
 	switch p.section {
 	case "keys":
 		k, ok := term.ParseKey(key)
@@ -449,7 +636,297 @@ func (p *parser) set(key, val string) {
 		if !p.dup(key) {
 			*dst = n
 		}
+	case "ui":
+		if key != "theme" {
+			p.bad("[ui] has no %s; it has theme", strconv.Quote(key))
+			return
+		}
+		if val == "" {
+			p.bad(`theme: want the name of a theme pack — the file's name in the themes dir, without .toml`)
+			return
+		}
+		if strings.ContainsAny(val, `/\`) || val == "." || val == ".." {
+			p.bad("theme %s: want a name, not a path; the themes dir is where packs live", strconv.Quote(val))
+			return
+		}
+		if !p.dup(key) {
+			p.f.ThemeName = val
+		}
+	case "layout":
+		o, ok := p.layoutOverride(key, val)
+		if !ok {
+			return
+		}
+		if !p.dup(key) {
+			p.f.Layout = append(p.f.Layout, o)
+		}
 	}
+}
+
+func (p *parser) validateExtensions() {
+	for name, x := range p.f.Extensions {
+		line := p.extensionLine[name]
+		if x.Manifest == "" {
+			p.problems = append(p.problems, fmt.Errorf("%s:%d: [extensions.%s] requires manifest", p.path, line, name))
+			continue
+		}
+		manifest, err := ext.LoadManifest(x.Manifest)
+		if err != nil {
+			p.problems = append(p.problems, fmt.Errorf("%s:%d: extension %s manifest: %w", p.path, line, strconv.Quote(name), err))
+			continue
+		}
+		if manifest.Name != name {
+			p.problems = append(p.problems, fmt.Errorf("%s:%d: extension section name %q does not match manifest name %q", p.path, line, name, manifest.Name))
+		}
+		declared := ext.NewCapabilitySet(manifest.Capabilities...)
+		for capability := range x.Allow {
+			if !declared.Has(capability) {
+				p.problems = append(p.problems, fmt.Errorf("%s:%d: extension %q allows %q, which its manifest does not declare", p.path, line, name, capability))
+			}
+		}
+	}
+}
+
+func validExtensionName(name string) bool {
+	if len(name) == 0 || len(name) > 63 || name[0] < 'a' || name[0] > 'z' {
+		return false
+	}
+	for _, r := range name[1:] {
+		if (r < 'a' || r > 'z') && (r < '0' || r > '9') && r != '-' {
+			return false
+		}
+	}
+	return true
+}
+
+func stringArray(raw string) ([]string, error) {
+	raw = strings.TrimSpace(raw)
+	if len(raw) < 2 || raw[0] != '[' || raw[len(raw)-1] != ']' {
+		return nil, errors.New(`want an array of quoted capabilities, such as ["events.subscribe"]`)
+	}
+	raw = strings.TrimSpace(raw[1 : len(raw)-1])
+	if raw == "" {
+		return []string{}, nil
+	}
+	var out []string
+	for raw != "" {
+		if raw[0] != '"' {
+			return nil, errors.New("array items must be quoted")
+		}
+		end, escaped := -1, false
+		for i := 1; i < len(raw); i++ {
+			if escaped {
+				escaped = false
+				continue
+			}
+			if raw[i] == '\\' {
+				escaped = true
+				continue
+			}
+			if raw[i] == '"' {
+				end = i
+				break
+			}
+		}
+		if end < 0 {
+			return nil, errors.New("unclosed quote in array")
+		}
+		item, err := strconv.Unquote(raw[:end+1])
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, item)
+		raw = strings.TrimSpace(raw[end+1:])
+		if raw == "" {
+			break
+		}
+		if raw[0] != ',' {
+			return nil, errors.New("want a comma between array items")
+		}
+		raw = strings.TrimSpace(raw[1:])
+		if raw == "" {
+			return nil, errors.New("trailing comma is not supported")
+		}
+	}
+	return out, nil
+}
+
+func (p *parser) setExtension(name, key, val string) {
+	x := p.f.Extensions[name]
+	if p.dup(key) {
+		return
+	}
+	switch key {
+	case "manifest":
+		if val == "" {
+			p.bad("manifest must not be empty")
+			return
+		}
+		if filepath.IsAbs(val) {
+			x.Manifest = filepath.Clean(val)
+		} else {
+			x.Manifest = filepath.Clean(filepath.Join(filepath.Dir(p.path), val))
+		}
+	case "enabled":
+		b, ok := p.flag(key, val)
+		if !ok {
+			return
+		}
+		x.Enabled = b
+	case "allow":
+		items, err := stringArray(val)
+		if err != nil {
+			p.bad("allow: %v", err)
+			return
+		}
+		set := ext.NewCapabilitySet()
+		for _, item := range items {
+			capability := ext.Capability(item)
+			// Parse the union here; validate against the loaded manifest's protocol below.
+			if !ext.KnownCapabilityFor("ext/v2", capability) {
+				p.bad("allow contains unknown capability %q", capability)
+				continue
+			}
+			if set.Has(capability) {
+				p.bad("allow contains duplicate capability %q", capability)
+				continue
+			}
+			set[capability] = struct{}{}
+		}
+		x.Allow = set
+	case "identity":
+		// Empty is the installer state before consent has been granted.
+		x.Identity = val
+	case "package_digest":
+		x.PackageDigest = val
+	case "generation":
+		n, err := strconv.Atoi(val)
+		if err != nil || n < 0 {
+			p.bad("generation must be a non-negative integer")
+			return
+		}
+		x.Generation = n
+	default:
+		p.bad("[extensions.%s] has no %s; it has manifest, enabled, allow, identity, package_digest and generation", name, strconv.Quote(key))
+		return
+	}
+	p.f.Extensions[name] = x
+}
+
+// The composition's vocabulary, indexed once for the [layout] checks. The names and
+// slots come from app, which owns them; this index exists so that every row of a file
+// can be checked against the same closed list the parser reports from — an invented
+// name or a slot nobody draws into is an error with a line number here, not a silent
+// no-op in the frame.
+var (
+	layoutVocabulary = func() map[string]ui.Slot {
+		m := make(map[string]ui.Slot)
+		for _, w := range app.CompositionWidgets() {
+			m[w.Name] = w.Slot
+		}
+		return m
+	}()
+	layoutSlots = func() []ui.Slot {
+		var out []ui.Slot
+		seen := map[ui.Slot]bool{}
+		for _, w := range app.CompositionWidgets() {
+			if !seen[w.Slot] {
+				seen[w.Slot] = true
+				out = append(out, w.Slot)
+			}
+		}
+		return out
+	}()
+)
+
+// layoutOverride parses one [layout] row: `slot`, `slot@width<N` or `slot@height<N` on
+// the left, an ordered list of widget names on the right — or "" for a veto, the slot
+// left empty. Every name is checked against the composition's vocabulary together with
+// the slot it belongs to, because a layout row may reorder and veto inside its own slot
+// but never move a widget between slots: the slot is the widget's own answer, and Place
+// is the one that resolves it.
+func (p *parser) layoutOverride(key, val string) (app.LayoutOverride, bool) {
+	var o app.LayoutOverride
+	slot, cond := key, ""
+	if at := strings.IndexByte(key, '@'); at >= 0 {
+		slot, cond = key[:at], key[at+1:]
+	}
+	s := ui.Slot(slot)
+	if !s.Declared() {
+		p.bad("%s is not a slot; `arxi-sim keys` prints the ones there are", strconv.Quote(slot))
+		return o, false
+	}
+	if !containsSlot(layoutSlots, s) {
+		p.bad("no widget asks for %s; the composition draws into %s", slot, joinSlots(layoutSlots))
+		return o, false
+	}
+	if cond != "" {
+		kind, nStr, has := strings.Cut(cond, "<")
+		if !has || (kind != "width" && kind != "height") {
+			p.bad("%s: after the @ want width<N or height<N, the row's condition", strconv.Quote(key))
+			return o, false
+		}
+		n, err := strconv.Atoi(nStr)
+		unit := "columns"
+		if kind == "height" {
+			unit = "rows"
+		}
+		if err != nil || n < 1 {
+			p.bad("%s: want a whole number of %s after the <, 1 or more", strconv.Quote(key), unit)
+			return o, false
+		}
+		if kind == "width" {
+			o.Width = n
+		} else {
+			o.Height = n
+		}
+	}
+	var names []string
+	if val != "" {
+		seen := map[string]bool{}
+		for _, part := range strings.Split(val, ",") {
+			name := strings.TrimSpace(part)
+			if name == "" {
+				p.bad("an empty name in the list; want widget names, comma-separated")
+				return o, false
+			}
+			home, ok := layoutVocabulary[name]
+			if !ok {
+				p.bad("%s is not a widget; `arxi-sim keys` prints the ones there are", strconv.Quote(name))
+				return o, false
+			}
+			if home != s {
+				p.bad("%s is drawn in %s and not %s; a layout row reorders its own slot", strconv.Quote(name), home, s)
+				return o, false
+			}
+			if seen[name] {
+				p.bad("%s is listed twice", strconv.Quote(name))
+				return o, false
+			}
+			seen[name] = true
+			names = append(names, name)
+		}
+	}
+	o.Slot = s
+	o.Names = names
+	return o, true
+}
+
+func containsSlot(slots []ui.Slot, s ui.Slot) bool {
+	for _, have := range slots {
+		if have == s {
+			return true
+		}
+	}
+	return false
+}
+
+func joinSlots(slots []ui.Slot) string {
+	out := make([]string, len(slots))
+	for i, s := range slots {
+		out[i] = string(s)
+	}
+	return strings.Join(out, ", ")
 }
 
 // count reads one positive whole number, which is the only kind of number any section here

@@ -5,8 +5,10 @@ import (
 	"fmt"
 	"sort"
 	"strconv"
+	"strings"
 
 	"arxi.local/sim/internal/app"
+	"arxi.local/sim/internal/ext"
 	"arxi.local/sim/internal/ui"
 )
 
@@ -24,6 +26,13 @@ type ControllerOptions struct {
 	Shine                                       bool
 	Anim                                        ui.Shimmer
 	MaskTitle, MaskScroll, MaskMouse, MaskShine bool
+
+	// ThemeName is the pack the run wears, after the flag-over-file ladder, and Theme
+	// is that pack as loaded — nil when none is worn. The controller never edits a
+	// theme: it reads the pack only to attribute what the user's own file was silent
+	// about, so the inspector says "worn" where it would otherwise say "default".
+	ThemeName string
+	Theme     *File
 }
 
 type scalarValues struct {
@@ -39,7 +48,14 @@ type Controller struct {
 	doc      *Document
 	baseline scalarValues
 	draft    scalarValues
-	file     *File
+	// dressed is the file with the pack layered under it — the tables the run actually
+	// reads. The draft and baseline stay raw, because /config edits and saves the
+	// user's own file, and baking theme values into it on a save nobody meant would be
+	// the theme writing over its reader. Effective columns read dressed; Value,
+	// Persisted and Dirty read raw.
+	dressed       *File
+	dressedValues scalarValues
+	file          *File
 }
 
 func NewController(o ControllerOptions) (*Controller, error) {
@@ -64,6 +80,11 @@ func NewController(o ControllerOptions) (*Controller, error) {
 	c := &Controller{opts: o, file: o.File}
 	c.baseline = valuesFromFile(o.File, o)
 	c.draft = c.baseline
+	c.dressed = o.File
+	if o.Theme != nil {
+		c.dressed = o.File.WithTheme(o.Theme)
+	}
+	c.dressedValues = valuesFromFile(c.dressed, o)
 	if o.Enabled {
 		d, err := LoadDocument(o.Path)
 		if err != nil {
@@ -98,6 +119,33 @@ func valuesFromFile(f *File, o ControllerOptions) scalarValues {
 }
 
 func (c *Controller) dirty() bool { return c.draft != c.baseline }
+
+// effectiveAnim gives a live draft the last word, then the worn pack, then the
+// shipped default already normalized into dressedValues. A pack only fills a field
+// the user's file left unset; once the reader edits that field in /config, the draft
+// is the user's own word and must be visible immediately rather than hidden behind
+// what the pack supplied at startup.
+func (c *Controller) effectiveAnim(id app.ConfigID) int {
+	switch id {
+	case app.ConfigPeriod:
+		if c.draft.period != c.baseline.period || c.file.Anim.Period != 0 {
+			return c.draft.period
+		}
+		return c.dressedValues.period
+	case app.ConfigTravel:
+		if c.draft.travel != c.baseline.travel || c.file.Anim.Travel != 0 {
+			return c.draft.travel
+		}
+		return c.dressedValues.travel
+	case app.ConfigWidth:
+		if c.draft.width != c.baseline.width || c.file.Anim.Width != 0 {
+			return c.draft.width
+		}
+		return c.dressedValues.width
+	}
+	return 0
+}
+
 func source(configured, masked bool) string {
 	if masked {
 		return "CLI"
@@ -115,6 +163,7 @@ func (c *Controller) Snapshot() app.ConfigSnapshot {
 		{Name: "Overview", Rows: []app.ConfigRow{
 			{Label: "Config path", Value: displayPath(c.opts.Path, c.opts.Enabled), Effective: displayPath(c.opts.Path, c.opts.Enabled), Source: "runtime", Apply: "read-only", Kind: app.ConfigReadOnly},
 			{Label: "Runtime", Value: c.opts.Runtime, Effective: c.opts.Runtime, Source: "runtime", Apply: "read-only", Kind: app.ConfigReadOnly},
+			c.themeRow(),
 		}},
 		{Name: "Input", Rows: []app.ConfigRow{c.textRow(app.ConfigInputTitle, "Title", c.draft.title, c.baseline.title, effectiveString(c.draft.title, c.opts.Title, c.opts.MaskTitle), c.file.InputTitle != "", c.opts.MaskTitle, "live")}},
 		{Name: "Scrolling", Rows: []app.ConfigRow{
@@ -123,19 +172,84 @@ func (c *Controller) Snapshot() app.ConfigSnapshot {
 		}},
 		{Name: "Animation", Rows: []app.ConfigRow{
 			c.boolRow(app.ConfigShine, "Shine", c.draft.shine, c.baseline.shine, effectiveBool(c.draft.shine, c.opts.Shine, c.opts.MaskShine), c.file.Shine != nil, c.opts.MaskShine, "live"),
-			c.intRow(app.ConfigPeriod, "Period", c.draft.period, c.baseline.period, c.draft.period, c.file.Anim.Period != 0, false, "live"),
-			c.intRow(app.ConfigTravel, "Travel", c.draft.travel, c.baseline.travel, c.draft.travel, c.file.Anim.Travel != 0, false, "live"),
-			c.intRow(app.ConfigWidth, "Width", c.draft.width, c.baseline.width, c.draft.width, c.file.Anim.Width != 0, false, "live"),
+			// The three numbers read their effective side from the dressed file, because a
+			// theme pack may set them where the user's file was silent. The draft and the
+			// dirty flag stay raw: editing starts from what the file would say, and a save
+			// writes what was edited, never what the pack wore.
+			c.intRow(app.ConfigPeriod, "Period", c.draft.period, c.baseline.period, c.effectiveAnim(app.ConfigPeriod), c.file.Anim.Period != 0, false, "live"),
+			c.intRow(app.ConfigTravel, "Travel", c.draft.travel, c.baseline.travel, c.effectiveAnim(app.ConfigTravel), c.file.Anim.Travel != 0, false, "live"),
+			c.intRow(app.ConfigWidth, "Width", c.draft.width, c.baseline.width, c.effectiveAnim(app.ConfigWidth), c.file.Anim.Width != 0, false, "live"),
 		}},
 		{Name: "Session", Rows: []app.ConfigRow{
 			{ID: "session.effort", Label: "Effort", Value: "", Effective: "", Source: "session", Apply: "immediate · not saved", Kind: app.ConfigText},
 			{ID: "session.recap", Label: "Recap", Value: "false", Effective: "false", Source: "session", Apply: "immediate · not saved", Kind: app.ConfigBool},
 		}},
+		{Name: "Layout", Rows: c.layoutRows()},
 		{Name: "Keys", Rows: c.keyRows()},
 		{Name: "Glyphs", Rows: c.glyphRows()},
 		{Name: "Styles", Rows: c.styleRows()},
 	}
 	return s
+}
+
+// themeRow is the Overview's answer to "what is this run wearing": the pack's name,
+// or the dash when none, with the themes dir beside it so the next question — where
+// would I put one — is answered on the same row.
+func (c *Controller) themeRow() app.ConfigRow {
+	name := c.opts.ThemeName
+	if name == "" {
+		name = "—"
+	}
+	return app.ConfigRow{
+		Label: "Theme", Value: name, Persisted: name, Effective: name,
+		Source: "runtime", Apply: "read-only", Kind: app.ConfigReadOnly,
+		Detail: "packs live in " + ThemesDir() + " · -theme beats [ui] theme · a pack layers under your own file, per key",
+	}
+}
+
+// layoutRows are the Layout category: one row per slot the composition draws into,
+// the file's word beside the composition's default. The effective column — what this
+// frame actually stacked, tiers resolved — is filled in by the app, which is the only
+// thing that knows how wide the terminal is; until then the row shows what was
+// written, which is the honest answer a file inspector can give on its own.
+func (c *Controller) layoutRows() []app.ConfigRow {
+	bySlot := map[ui.Slot][]string{}
+	var order []ui.Slot
+	for _, w := range app.CompositionWidgets() {
+		if _, seen := bySlot[w.Slot]; !seen {
+			order = append(order, w.Slot)
+		}
+		bySlot[w.Slot] = append(bySlot[w.Slot], w.Name)
+	}
+	written := map[ui.Slot][]app.LayoutOverride{}
+	for _, o := range c.file.Layout {
+		written[o.Slot] = append(written[o.Slot], o)
+	}
+	rows := make([]app.ConfigRow, 0, len(order))
+	for _, slot := range order {
+		def := strings.Join(bySlot[slot], ", ")
+		id := app.ConfigID("layout." + string(slot))
+		ws, has := written[slot]
+		if !has {
+			rows = append(rows, app.ConfigRow{ID: id, Label: string(slot), Value: def, Persisted: def, Effective: def, Source: "default", Apply: "read-only", Kind: app.ConfigReadOnly, Detail: "the composition's own order"})
+			continue
+		}
+		for _, o := range ws {
+			label := string(slot)
+			if o.Width > 0 {
+				label += fmt.Sprintf(" @width<%d", o.Width)
+			}
+			if o.Height > 0 {
+				label += fmt.Sprintf(" @height<%d", o.Height)
+			}
+			v := strings.Join(o.Names, ", ")
+			if v == "" {
+				v = "(empty)"
+			}
+			rows = append(rows, app.ConfigRow{ID: id, Label: label, Value: v, Persisted: v, Effective: v, Source: "file", Apply: "read-only", Kind: app.ConfigReadOnly, Detail: "default " + def})
+		}
+	}
+	return rows
 }
 
 func displayPath(path string, enabled bool) string {
@@ -247,6 +361,11 @@ func (c *Controller) Save() error {
 		return err
 	}
 	c.file = f
+	c.dressed = f
+	if c.opts.Theme != nil {
+		c.dressed = f.WithTheme(c.opts.Theme)
+	}
+	c.dressedValues = valuesFromFile(c.dressed, c.opts)
 	c.baseline = c.draft
 	return nil
 }
@@ -268,8 +387,76 @@ func (c *Controller) Reload(discard bool) error {
 	}
 	c.doc = d
 	c.file = f
+	c.dressed = f
+	if c.opts.Theme != nil {
+		c.dressed = f.WithTheme(c.opts.Theme)
+	}
+	c.dressedValues = valuesFromFile(c.dressed, c.opts)
 	c.baseline = valuesFromFile(f, c.opts)
 	c.draft = c.baseline
+	return nil
+}
+
+// Extensions returns an independent snapshot consumable by startup integration.
+func (c *Controller) Extensions() map[string]Extension {
+	out := make(map[string]Extension, len(c.file.Extensions))
+	for name, value := range c.file.Extensions {
+		value.Allow = ext.NewCapabilitySet(capabilities(value.Allow)...)
+		out[name] = value
+	}
+	return out
+}
+
+func capabilities(set ext.CapabilitySet) []ext.Capability {
+	out := make([]ext.Capability, 0, len(set))
+	for capability := range set {
+		out = append(out, capability)
+	}
+	return out
+}
+
+// SetExtensionConsent persists an exact grant and the identity it applies to.
+func (c *Controller) SetExtensionConsent(name string, allow ext.CapabilitySet, identity string) error {
+	if !c.opts.Enabled || c.doc == nil {
+		return errors.New("save is disabled for this run")
+	}
+	if _, ok := c.file.Extensions[name]; !ok {
+		return fmt.Errorf("extension %q is not configured", name)
+	}
+	if err := c.doc.SetExtensionConsent(name, allow, identity); err != nil {
+		return err
+	}
+	if err := c.doc.Save(); err != nil {
+		return err
+	}
+	f, err := Parse(c.opts.Path, c.doc.Bytes())
+	if err != nil {
+		return err
+	}
+	c.file = f
+	return nil
+}
+
+// SetExtensionAllow persists an exact grant set immediately, with the same
+// optimistic-concurrency protection as other controller saves.
+func (c *Controller) SetExtensionAllow(name string, allow ext.CapabilitySet) error {
+	if !c.opts.Enabled || c.doc == nil {
+		return errors.New("save is disabled for this run")
+	}
+	if _, ok := c.file.Extensions[name]; !ok {
+		return fmt.Errorf("extension %q is not configured", name)
+	}
+	if err := c.doc.SetExtensionAllow(name, allow); err != nil {
+		return err
+	}
+	if err := c.doc.Save(); err != nil {
+		return err
+	}
+	f, err := Parse(c.opts.Path, c.doc.Bytes())
+	if err != nil {
+		return err
+	}
+	c.file = f
 	return nil
 }
 
@@ -316,39 +503,67 @@ func (c *Controller) keyRows() []app.ConfigRow {
 	return rows
 }
 
+// packGlyphs and packStyles answer the worn pack's tables, or nil when none is worn.
+// A read on a nil map is the empty answer, which is the right one here; the guard is
+// for the nil *File the map would have to be reached through.
+func (c *Controller) packGlyphs() map[string]string {
+	if c.opts.Theme != nil {
+		return c.opts.Theme.Glyphs
+	}
+	return nil
+}
+
+func (c *Controller) packStyles() map[string]ui.Style {
+	if c.opts.Theme != nil {
+		return c.opts.Theme.Styles
+	}
+	return nil
+}
+
 func (c *Controller) glyphRows() []app.ConfigRow {
-	eff, _ := c.file.GlyphSet(c.opts.ASCII)
+	eff, _ := c.dressed.GlyphSet(c.opts.ASCII)
 	rows := make([]app.ConfigRow, 0, len(ui.GlyphKeys))
 	for _, d := range ui.GlyphDocs() {
 		configured := "—"
 		src := "default"
+		detail := ""
 		if v, ok := c.file.Glyphs[d.Key]; ok {
 			configured = strconv.Quote(v)
 			src = "file"
+		} else if v, ok := c.packGlyphs()[d.Key]; ok {
+			// The file was silent and the worn pack speaks, so the key is worn rather
+			// than default. The pack's word is named in the detail line and never in
+			// the configured column, which is only ever what the user's own file says.
+			src = "theme " + c.opts.ThemeName
+			detail = "the pack wears " + strconv.Quote(v)
 		}
 		def := d.Default
 		if c.opts.ASCII {
 			def = d.Fallback
 		}
 		ev := eff.Value(d.Key)
-		rows = append(rows, app.ConfigRow{Label: d.Key, Value: strconv.Quote(ev), Persisted: configured, Effective: strconv.Quote(ev), Source: src, Apply: "read-only", Kind: app.ConfigReadOnly, Detail: "default " + strconv.Quote(def) + " · configured " + configured + " · effective " + strconv.Quote(ev)})
+		rows = append(rows, app.ConfigRow{Label: d.Key, Value: strconv.Quote(ev), Persisted: configured, Effective: strconv.Quote(ev), Source: src, Apply: "read-only", Kind: app.ConfigReadOnly, Detail: strings.TrimSpace("default " + strconv.Quote(def) + " · configured " + configured + " · effective " + strconv.Quote(ev) + " · " + detail)})
 	}
 	return rows
 }
 
 func (c *Controller) styleRows() []app.ConfigRow {
 	def := ui.DefaultTheme()
-	eff, _ := c.file.Theme()
+	eff, _ := c.dressed.Theme()
 	rows := make([]app.ConfigRow, 0, len(ui.Keys))
 	for _, d := range ui.Keys {
 		configured := "—"
 		src := "default"
+		detail := ""
 		if v, ok := c.file.Styles[d.Key]; ok {
 			configured = v.String()
 			if configured == "" {
 				configured = "empty"
 			}
 			src = "file"
+		} else if v, ok := c.packStyles()[d.Key]; ok {
+			src = "theme " + c.opts.ThemeName
+			detail = "the pack wears " + v.String()
 		}
 		dv := def.Resolve(d.Key).String()
 		if dv == "" {
@@ -358,7 +573,7 @@ func (c *Controller) styleRows() []app.ConfigRow {
 		if ev == "" {
 			ev = "empty"
 		}
-		rows = append(rows, app.ConfigRow{Label: d.Key, Value: ev, Persisted: configured, Effective: ev, Source: src, Apply: "read-only", Kind: app.ConfigReadOnly, Detail: "default " + dv + " · configured " + configured + " · effective " + ev})
+		rows = append(rows, app.ConfigRow{Label: d.Key, Value: ev, Persisted: configured, Effective: ev, Source: src, Apply: "read-only", Kind: app.ConfigReadOnly, Detail: strings.TrimSpace("default " + dv + " · configured " + configured + " · effective " + ev + " · " + detail)})
 	}
 	return rows
 }

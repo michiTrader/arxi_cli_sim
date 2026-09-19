@@ -228,16 +228,29 @@ func TestEffortWidgetBelow24UsesOnlyOptions(t *testing.T) {
 }
 
 func TestEffortWidgetAnimatedOnMax(t *testing.T) {
-	es := NewEffortSlider("max", 72)
-	ew := EffortWidget{Slider: es}
-	if !ew.Animated() {
-		t.Fatal("EffortWidget should be animated on max")
+	for _, tc := range []struct {
+		level string
+		phase int
+		want  int
+	}{
+		{"max", 0, 2},
+		{"max", 1, 1},
+		{"ultracode", 2, 2},
+		{"ultracode", -1, 1},
+		{"high", 0, 0},
+	} {
+		es := NewEffortSlider(tc.level, 72)
+		es.Phase = tc.phase
+		ew := EffortWidget{Slider: es}
+		if got := ew.NextVisualChange(); got != tc.want {
+			t.Errorf("%s at phase %d reports %d ticks, want %d", tc.level, tc.phase, got, tc.want)
+		}
+		if ew.Animated() != (tc.want > 0) {
+			t.Errorf("%s at phase %d has Animated=%v", tc.level, tc.phase, ew.Animated())
+		}
 	}
-
-	es2 := NewEffortSlider("high", 72)
-	ew2 := EffortWidget{Slider: es2}
-	if ew2.Animated() {
-		t.Fatal("EffortWidget should not be animated on high")
+	if got := (EffortWidget{}).NextVisualChange(); got != 0 {
+		t.Errorf("a nil effort widget reports %d ticks", got)
 	}
 }
 

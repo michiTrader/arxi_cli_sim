@@ -8,3 +8,4 @@
 # and a token pushed here is a token revoked the hard way.
 /.claude/
 /.codex/
+/.zcode/

@@ -1382,12 +1382,9 @@ func TestMonoEmitsNoColour(t *testing.T) {
 	}
 }
 
-// TestTheMouseIsTheReadersUnlessAskedFor is the byte half of the decision that gives the drag
-// back to the terminal. Three things want the mouse and only two can have it: tracking makes a
-// notch arrive as a report and takes drag-to-select away, releasing the mouse gives the drag
-// back, and alternate scroll (1007) would then rewrite a notch into the arrow keys the input's
-// history is bound to. So the default releases the mouse and switches 1007 off, -mouse claims
-// tracking and leaves 1007 alone, and Exit undoes whichever of the two was done and not both.
+// TestTheMouseIsTheReadersUnlessAskedFor is the byte half of the mouse ownership decision.
+// Tracking makes a notch arrive as a report and takes ordinary terminal presses away; releasing
+// it gives those presses back, including the tap Termux uses to restore Android's keyboard.
 func TestTheMouseIsTheReadersUnlessAskedFor(t *testing.T) {
 	// Written out rather than asked of ansi.SetMode: this is the test that says what the
 	// terminal actually receives, and an expectation computed from the code under test would
@@ -1744,4 +1741,120 @@ func eraseAfterText(s string) (string, bool) {
 		}
 	}
 	return "", false
+}
+
+// TestScrollbackWritesTheRowsTheWindowLeavesIntoHistory is the byte half of the phone's
+// surface. The oracle is the newline count — the claim spends Height of them once, a commit
+// spends one more for every row the window leaves, and the paint spends none — plus the
+// handover, which after any number of commits has to print exactly the rows no scroll
+// carried down, so the transcript reaches the terminal once, in order, by the two of them.
+func TestScrollbackWritesTheRowsTheWindowLeavesIntoHistory(t *testing.T) {
+	e := &Emitter{Theme: DefaultTheme(), Mode: ModeInline, Profile: ProfileMono, Scrollback: true}
+	out := string(e.Enter())
+
+	// stream builds one conversation frame in miniature: a six-row screen, a four-row
+	// window of transcript over two rows of chrome, and the offset the renderer would
+	// have reported for it.
+	stream := func(above, below int, rows ...string) Frame {
+		f := Frame{Height: 6, Width: 20, Scrollback: true, Scroll: Scroll{Above: above, Below: below, Rows: 4}}
+		for _, r := range rows {
+			f.Live = append(f.Live, Line{{Text: r}})
+		}
+		return f
+	}
+
+	// The first paint spends the claim's six and nothing more, whatever its offset says:
+	// rows the screen has never shown are the handover's debt, and a scroll carrying
+	// blank screen down as if they were transcript would be co-signing a forgery.
+	out += string(e.Emit(stream(0, 2, "t0", "t1", "t2", "t3", "chrome", "input")))
+	if got := strings.Count(out, "\n"); got != 6 {
+		t.Fatalf("the first frame spent %d newlines, want the claim's 6", got)
+	}
+
+	// One row arrives, the window slides down one, and the row it leaves goes into
+	// history: a cursor to the foot of the screen, one newline, then the repaint.
+	out += string(e.Emit(stream(1, 0, "t1", "t2", "t3", "t4", "chrome", "input")))
+	if got := strings.Count(out, "\n") - 6; got != 1 {
+		t.Fatalf("the first commit spent %d newlines, want 1", got)
+	}
+	out += string(e.Emit(stream(2, 0, "t2", "t3", "t4", "t5", "chrome", "input")))
+	if got := strings.Count(out, "\n") - 7; got != 1 {
+		t.Fatalf("the second commit spent %d newlines, want 1", got)
+	}
+
+	// A frame from another view repaints the screen and moves nothing. It is not the
+	// transcript; neither its rows nor its offsets say where history ends, and a scroll
+	// here would carry the visitor's rows into a history they do not belong to.
+	visitor := Frame{Height: 6, Width: 20, Scroll: Scroll{Above: 9, Below: 0, Rows: 4}}
+	visitor.Live = append(visitor.Live, Line{{Text: "roster"}})
+	out += string(e.Emit(visitor))
+	if got := strings.Count(out, "\n") - 8; got != 0 {
+		t.Fatalf("a visitor frame spent %d newlines, want 0", got)
+	}
+
+	// Back on the stream, the commit runs from where the stream stopped — the two rows
+	// the window grew past — and not from wherever the visitor's offset pointed.
+	out += string(e.Emit(stream(4, 0, "t4", "t5", "t6", "t7", "chrome", "input")))
+	if got := strings.Count(out, "\n") - 8; got != 2 {
+		t.Fatalf("the commit after a visitor spent %d newlines, want 2", got)
+	}
+
+	// And the handover owes the complement. Four rows went down by scroll, so the
+	// transcript it prints starts at the fifth: t0 to t3 are already in the history,
+	// and printing them again would read as the conversation saying everything twice.
+	doc := Frame{Width: 20}
+	for _, r := range []string{"t0", "t1", "t2", "t3", "t4", "t5", "t6", "t7"} {
+		doc.Committed = append(doc.Committed, Line{{Text: r}})
+	}
+	back := string(e.Emit(doc))
+	for _, r := range []string{"t0", "t1", "t2", "t3"} {
+		if strings.Contains(back, r+"\r\n") {
+			t.Fatalf("the handover reprinted %q, a row a scroll already carried down: %q", r, back)
+		}
+	}
+	for _, r := range []string{"t4", "t5", "t6", "t7"} {
+		if !strings.Contains(back, r+"\r\n") {
+			t.Fatalf("the handover is missing %q: %q", r, back)
+		}
+	}
+}
+
+// TestScrollbackStandsDownUntilTheScreenAgreesWithHistory holds the two guards the commit
+// cannot live without. A screen whose top is not the row the high-water mark says — a
+// session that opened mid-log, a screen the chrome alone fills — cannot scroll honestly,
+// because a scroll carries the screen's top row and that row is not history's next row. The
+// way back is the seam: the caller lays the window's top on the row history ends at, the
+// paint makes the screen agree, and the frame after it commits as if nothing had happened.
+func TestScrollbackStandsDownUntilTheScreenAgreesWithHistory(t *testing.T) {
+	e := &Emitter{Theme: DefaultTheme(), Mode: ModeInline, Profile: ProfileMono, Scrollback: true}
+	e.Enter()
+	stream := func(above, below int, rows ...string) Frame {
+		f := Frame{Height: 6, Width: 20, Scrollback: true, Scroll: Scroll{Above: above, Below: below, Rows: 4}}
+		for _, r := range rows {
+			f.Live = append(f.Live, Line{{Text: r}})
+		}
+		return f
+	}
+
+	// A window that opens mid-transcript: rows t0 to t2 were never on screen, so no
+	// scroll can carry them down and none may start until the screen and the mark agree.
+	out := string(e.Emit(stream(3, 0, "t3", "t4", "t5", "t6", "chrome", "input")))
+	if got := strings.Count(out, "\n"); got != 6 {
+		t.Fatalf("a first frame above row zero spent %d newlines, want the claim's 6", got)
+	}
+	out += string(e.Emit(stream(4, 0, "t4", "t5", "t6", "t7", "chrome", "input")))
+	if got := strings.Count(out, "\n") - 6; got != 0 {
+		t.Fatalf("a commit from a misaligned screen spent %d newlines, want 0", got)
+	}
+
+	// The seam. Below is not zero on it — the window ends short of the tail — which is
+	// its own guard: nothing commits until a frame paints the screen into agreement.
+	out += string(e.Emit(stream(0, 4, "t0", "t1", "t2", "t3", "chrome", "input")))
+	if got := strings.Count(out, "\n") - 6; got != 0 {
+		t.Fatalf("a seam spent %d newlines, want 0", got)
+	}
+	out += string(e.Emit(stream(1, 0, "t1", "t2", "t3", "t4", "chrome", "input")))
+	if got := strings.Count(out, "\n") - 6; got != 1 {
+		t.Fatalf("the frame after a seam spent %d newlines, want 1", got)
+	}
 }

@@ -99,8 +99,21 @@ type Frame struct {
 	Width     int
 	Height    int
 
+	// NextVisualChange is the number of shared animation ticks after this frame at
+	// which its appearance may next differ. Zero means the frame is stable. It is
+	// scheduling metadata only: emitters and plain-text renderers ignore it.
+	NextVisualChange int
+
 	// Scroll is where this frame ended up looking. See Scroll.
 	Scroll Scroll
+
+	// Scrollback marks this frame as one whose window rides the tail of a transcript
+	// whose history is being written to the terminal as the window leaves it. Only such
+	// a frame may move the emitter's high-water mark: the other full-frame views — the
+	// roster, the config editor, a consent — repaint the same screen with content that
+	// is not the transcript, and neither their rows nor their scroll offsets say
+	// anything about where history ends.
+	Scrollback bool
 
 	// Side is where the column beside the transcript ended up, in the coordinates of Live: X is
 	// the column the prose stopped at, Y the row of Live the transcript window begins on, and W
@@ -192,6 +205,18 @@ type Viewport struct {
 	// fill them, because a wrap point that appears and disappears is worse than a narrow one.
 	SidePanels bool
 	FixedTop   bool // a fixed top band can be held
+
+	// Scrollback says the terminal's own history is where this transcript's older rows
+	// live: the window is always its tail, and every row the window leaves behind is
+	// committed to history as it goes. A surface that says so is one the reader scrolls
+	// with the terminal's own gesture — a finger on Termux — so the renderer keeps no
+	// view of its own to move. Scrolled is not the reader's here, it is the caller's,
+	// and it asks for one exact row at the top of the window, unclamped past the tail
+	// if that is what the caller needs, because only the caller knows why. ScrollTop
+	// doubles as the floor the window's top may not retreat below: a screen that grows
+	// would otherwise walk the top back over rows history already holds, and re-showing
+	// a committed row is printing it twice.
+	Scrollback bool
 
 	// Scrolled and ScrollTop are where the human is looking, and they are a pair:
 	// ScrollTop is read only when Scrolled is set. The zero value therefore means

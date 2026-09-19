@@ -15,8 +15,9 @@ type appView uint8
 const (
 	viewConversation appView = iota
 	viewTeam
-	viewTasks
 	viewConfig
+	viewConsent
+	viewExtension
 )
 
 // renderTeam builds the complete Team surface from current folded state. It owns

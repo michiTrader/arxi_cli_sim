@@ -1,0 +1,6 @@
+┌ Deploy 日本 ───┐
+│Running health  │
+│checks          │
+│✓ api 東京      │
+│Latency is above│
+┌ ↑↓ scroll ─────┘

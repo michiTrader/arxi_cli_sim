@@ -31,8 +31,11 @@ func longResult(n int) state.Item {
 
 // resultRows is the result half of a tool block. The indent is the width of the tool
 // marker, which is what renderTool passes and the only thing the elbow is offset by.
+// The standard level is named for the same reason renderTool names it: the elision
+// under test here is the standard level's, and the full level's contract is that it
+// has none.
 func resultRows(it state.Item, width int, g Glyphs) []Line {
-	return ItemBlock{It: it}.resultLines(width, 2, g)
+	return ItemBlock{It: it}.resultLines(width, 2, DetailStandard, g)
 }
 
 // resultText is a row with its prefix taken off: the pad, and on the first row the
@@ -503,11 +506,11 @@ func TestAFinishedThoughtHasNoMarker(t *testing.T) {
 		t.Fatalf("a finished thought drew %d rows: %s", len(rows), plain(rows))
 	}
 	got := rows[0].Text()
-	if !strings.HasPrefix(got, "  Thought for ") {
+	if !strings.HasPrefix(got, "  Thought · ") {
 		t.Errorf("a finished thought reads %q, want two columns of indent and the sentence", got)
 	}
 	for _, r := range got {
-		if r > 0x7e {
+		if r > 0x7e && r != '·' {
 			t.Errorf("a finished thought carries the non-ascii %q: %q", r, got)
 			break
 		}

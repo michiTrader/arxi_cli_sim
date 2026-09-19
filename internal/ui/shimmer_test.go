@@ -454,7 +454,75 @@ func TestSlowerLengthensTheRestAndNothingElse(t *testing.T) {
 	}
 }
 
-// TestAnUnknownKeyIsOneHardEdgedBand is the seam kept open rather than an oversight. A program
+func TestLongerRestPreservesThePassAndReportsItsDeadline(t *testing.T) {
+	base := Shimmer{Style: InputShine}.Slower(2)
+	long := base.LongerRest(4)
+	if long.Travel != 8 || long.Period != 296 || long.Width != base.Width {
+		t.Fatalf("LongerRest(4) returned %+v, want travel 8, period 296, unchanged width", long)
+	}
+	for phase := 0; phase < long.Travel; phase++ {
+		fast, slow := base, long
+		fast.Phase, slow.Phase = phase, phase
+		if got, want := slow.Apply(row(72, "input.text"), 72), fast.Apply(row(72, "input.text"), 72); got.Text() != want.Text() || strings.Join(keysOf(t, got), "|") != strings.Join(keysOf(t, want), "|") {
+			t.Fatalf("phase %d of the longer rest changed the visible pass", phase)
+		}
+		if slow.NextVisualChange() != 1 {
+			t.Errorf("phase %d reports its next change in %d ticks, want 1", phase, slow.NextVisualChange())
+		}
+	}
+	for phase := long.Travel; phase < long.Period; phase++ {
+		s := long
+		s.Phase = phase
+		if _, _, ok := s.Band(72); ok {
+			t.Fatalf("phase %d of the dark rest is lit", phase)
+		}
+		if got, want := s.NextVisualChange(), long.Period-phase; got != want {
+			t.Errorf("phase %d reports %d ticks, want %d", phase, got, want)
+		}
+	}
+	restarted := long
+	restarted.Phase = long.Period
+	if restarted.NextVisualChange() != 1 {
+		t.Errorf("the restarted pass reports %d ticks, want 1", restarted.NextVisualChange())
+	}
+	if _, _, ok := restarted.Band(72); !ok {
+		t.Fatal("phase 296 did not restart the pass")
+	}
+	for _, phase := range []int{-1, -long.Period + long.Travel, long.Period + long.Travel} {
+		s := long
+		s.Phase = phase
+		wrapped := ((phase % long.Period) + long.Period) % long.Period
+		want := 1
+		if wrapped >= long.Travel {
+			want = long.Period - wrapped
+		}
+		if got := s.NextVisualChange(); got != want {
+			t.Errorf("phase %d reports %d ticks, want wrapped deadline %d", phase, got, want)
+		}
+	}
+	if got := (Shimmer{}).NextVisualChange(); got != 0 {
+		t.Errorf("an off shimmer reports a deadline of %d", got)
+	}
+}
+
+func TestRestScalingIdentityAndOverflow(t *testing.T) {
+	base := Shimmer{Style: InputShine, Period: 17, Travel: 3, Width: 5}
+	for _, n := range []int{-1, 0, 1} {
+		if got := base.LongerRest(n); got != base {
+			t.Errorf("LongerRest(%d) returned %+v, want identity", n, got)
+		}
+	}
+	if got := (Shimmer{}).LongerRest(4); got.On() {
+		t.Errorf("LongerRest armed an off shimmer: %+v", got)
+	}
+	if got := (Shimmer{Style: InputShine, Period: math.MaxInt, Travel: 1}).LongerRest(2); got.Period != math.MaxInt {
+		t.Errorf("overflowing LongerRest returned period %d, want MaxInt", got.Period)
+	}
+	if got := (Shimmer{Style: InputShine, Period: math.MaxInt}).Slower(2); got.Period != math.MaxInt {
+		t.Errorf("overflowing Slower returned period %d, want MaxInt", got.Period)
+	}
+}
+
 // embedding this package can shine in a key of its own — one it declared and themed itself — and
 // what it gets is a band with two edges, because there is no ladder to fall off along. The
 // alternative would be a lookup failure drawn as nothing at all, which is the one outcome a

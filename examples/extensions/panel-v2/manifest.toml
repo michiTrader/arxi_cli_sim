@@ -1,0 +1,5 @@
+name = "panel-v2"
+version = "1.0.0"
+protocol = "ext/v2"
+executable = "bin/panel-v2"
+capabilities = ["panel.render"]

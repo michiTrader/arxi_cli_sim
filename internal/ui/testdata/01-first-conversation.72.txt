@@ -1,6 +1,6 @@
 ❯ the login flow breaks on refresh, find out why                        
 
-  Thought for 0.4s (medium effort)
+  Thought · a few seconds (medium effort)
 
 Let me read the session store.
 

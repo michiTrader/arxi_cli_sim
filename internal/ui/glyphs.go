@@ -53,8 +53,8 @@ var GlyphKeys = []GlyphDecl{
 	{"status.member.failed", "✗", "in front of a team member whose turn failed", "x"},
 	{"status.member.idle", "○", "in front of a team member with no open turn", "o"},
 	{"status.sep", "·", "between two segments of the status line", "|"},
-	{"tasks.pending", "○", "in front of a pending task", "o"},
-	{"tasks.active", "◐", "in front of an active task", ">"},
+	{"tasks.pending", "◻", "in front of a pending task", "o"},
+	{"tasks.active", "◼", "in front of an active task", ">"},
 	{"tasks.completed", "✓", "in front of a completed task", "x"},
 	// A light vertical and a full block, so the difference between them is weight rather than
 	// shape: the bar is one object seen at two brightnesses, and a reader picks the thumb out of

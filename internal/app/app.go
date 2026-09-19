@@ -15,10 +15,12 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"strconv"
 	"strings"
 	"time"
 
 	"arxi.local/sim/internal/event"
+	"arxi.local/sim/internal/ext/viewmodel"
 	"arxi.local/sim/internal/scenario"
 	"arxi.local/sim/internal/state"
 	"arxi.local/sim/internal/term"
@@ -54,17 +56,15 @@ type Config struct {
 	// caller has no terminal to ask (a test, a pipe) and Width and Height stand.
 	Size func() (int, int)
 
-	// Now is the wall clock, and one thing reads it: the wheel. How far a report of it carries
-	// depends on how long ago the last one arrived, because that gap is the whole difference
-	// between a hand resting on the wheel and a hand spinning it, and no report says which it
-	// belongs to. It is a function for the same reason Size is one — the caller is where the
-	// world is — and a test that supplies it spins the wheel as fast as it likes without
-	// sleeping for it. Nil means time.Now.
+	// Now and After are the wall clock used by input gestures and visual deadlines.
+	// They share one domain so a test can advance animation without sleeping. Nil
+	// means time.Now and time.After respectively.
 	//
 	// Simulated time is emphatically not this. A recording's clock is divided by Speed and
 	// stops dead at a barrier; a reader's hand does neither, and a wheel measured in scenario
 	// time would accelerate differently under -speed 4 than under -speed 1.
-	Now func() time.Time
+	Now   func() time.Time
+	After func(time.Duration) <-chan time.Time
 
 	// Speed divides every recorded delay: 2 is twice as fast, 0.5 is half. A test
 	// passes something enormous and the recording plays out in a few microseconds.
@@ -83,14 +83,24 @@ type Config struct {
 	// otherwise ours to touch.
 	InputTitle string
 
+	// Layout is the [layout] table as parsed: per-slot overrides of the composition's
+	// own order, tiers included. Nil or empty is the composition as shipped, and
+	// chrome() answers byte for byte what it always did — the zero-layout rule, the
+	// same one every other setting here already keeps.
+	Layout []LayoutOverride
+
 	// Config is the optional full-frame configuration controller. Its interface lives here
 	// so the config package may implement it without an import cycle.
 	Config ConfigController
 
+	// Extensions is the consumer-owned process integration seam. Nil preserves the
+	// historical loop and output byte for byte.
+	Extensions ExtensionManager
+
 	// Shine is the shape of the band of light that crosses the input box while the turn is
 	// the human's, and the word "working" while it is not. Zero is no shine anywhere: every
-	// frame then draws exactly what it drew before the animation existed, and animated()
-	// stays false on an idle prompt, so the loop still parks at zero CPU.
+	// frame then draws exactly what it drew before the animation existed, and a stable
+	// Frame reports no visual deadline, so the loop parks at zero CPU.
 	//
 	// One field for both bands, because they are one phenomenon and a reader who slows the
 	// sweep down means both of them. Two of its fields are read differently from the rest.
@@ -156,13 +166,30 @@ type App struct {
 	km  *Keymap
 	vp  ui.Viewport
 
-	// view owns the current full-frame surface. Team and Tasks share local
+	// view owns the current full-frame surface. Team and Config share local
 	// scroll geometry so either can open without moving the conversation.
 	view       appView
 	viewTop    int
 	viewRows   int
 	viewBelow  int
 	configView *configViewState
+
+	// streamed says the screen is currently holding the conversation's own rows, which
+	// is what lets a scrollback surface commit the rows its window leaves behind: a
+	// scroll carries whatever the screen's top is holding, and after a roster or a
+	// config editor has painted, that is not the transcript. Every non-conversation
+	// draw clears it and the next conversation draw answers with one seam frame — the
+	// window parked at the row history ends on, repainting over the visitor — before
+	// any further commit.
+	streamed bool
+
+	// tasksOpen is whether the Tasks panel above the input is dropped down. It
+	// starts open: a run that ships tasks is telling the reader what is happening,
+	// and the summary alone made them press a key to find out. The panel is fixed —
+	// collapsed it is the one summary line the widget has always drawn, open it is
+	// the bounded list, and the toggle keys flip between the two without anything
+	// else on the screen moving.
+	tasksOpen bool
 
 	// overlay is the active floating window, or nil. When set, key routing
 	// changes: arrow keys and enter go to the overlay instead of the editor.
@@ -176,6 +203,33 @@ type App struct {
 
 	// smenu is the slash command suggestion dropdown, rebuilt after every edit.
 	smenu slashMenu
+
+	// toast is the transient the input's right border is holding up, and toastUntil
+	// is when it comes back down. A level change is worth naming once — the
+	// transcript just re-flowed under the reader, and the reason should be on
+	// screen — and worth forgetting soon, which is why it is a deadline and not a
+	// flag: draw takes it down when the clock has passed it, and scheduleFrame arms
+	// the wake that makes that draw happen even in a session where nothing else
+	// moves.
+	toast      string
+	toastUntil time.Time
+
+	// Extension actions are process-scoped and disappear on disconnect. Consent is
+	// kept as a full-frame view before the manager starts native code.
+	extActions  map[Action]string
+	consents    []ExtensionConsent
+	extPanels   map[string]extensionPanel
+	extPanel    string
+	extCapture  string
+	extResize   map[string][2]int
+	extRedraw   bool
+	extDeadline <-chan time.Time
+
+	// layout is the parsed [layout] table, empty when the config named none — which
+	// is the ordinary case and the byte-identical one. chrome() consults it per
+	// frame, so a tier's width and height conditions are re-read against the
+	// terminal as it is now, not as it was when the run started.
+	layout []LayoutOverride
 
 	steps []scenario.Step
 	next  int           // index of the step that has not played yet
@@ -263,7 +317,13 @@ type App struct {
 	// simulated time is exactly what stops passing when it is not: -speed 4 spins the
 	// same, a barrier spins on while the clock stands still, and a 1400 ms tool call
 	// spins for 1400 ms instead of jumping one frame when its result lands.
-	phase int
+	// frameNext is the deadline reported by the frame on screen. phaseAt anchors
+	// phase to wall time only while that frame can change; a stable frame pauses
+	// the shared animation clock until another event arms it again.
+	phase     int
+	phaseAt   time.Time
+	frameNext int
+	animation <-chan time.Time
 
 	quit bool
 
@@ -297,6 +357,9 @@ func New(cfg Config) *App {
 	if cfg.Now == nil {
 		cfg.Now = time.Now
 	}
+	if cfg.After == nil {
+		cfg.After = time.After
+	}
 	if cfg.Emitter == nil {
 		cfg.Emitter = &ui.Emitter{Theme: ui.DefaultTheme(), Mode: ui.ModeInline, Profile: ui.ProfileTrueColor}
 	}
@@ -305,15 +368,29 @@ func New(cfg Config) *App {
 	}
 
 	a := &App{
-		cfg:      cfg,
-		st:       state.New(),
-		ed:       ui.NewInput(),
-		r:        ui.NewRenderer(),
-		em:       cfg.Emitter,
-		km:       cfg.Keymap,
-		released: make(map[string]int),
+		cfg:        cfg,
+		st:         state.New(),
+		ed:         ui.NewInput(),
+		r:          ui.NewRenderer(),
+		em:         cfg.Emitter,
+		km:         cfg.Keymap,
+		released:   make(map[string]int),
+		extActions: make(map[Action]string),
+		extPanels:  make(map[string]extensionPanel),
+		extResize:  make(map[string][2]int),
+		tasksOpen:  true,
+		layout:     cfg.Layout,
+		streamed:   true,
+	}
+	if cfg.Extensions != nil {
+		a.consents = cfg.Extensions.Pending()
+		if len(a.consents) > 0 {
+			a.openFullView(viewConsent)
+		}
 	}
 	a.ed.Title = cfg.InputTitle
+	// A session opens compact: the run's shape first, the machinery one ctrl+o away.
+	a.r.Detail = ui.DetailCompact
 	if cfg.Scenario != nil {
 		a.steps = cfg.Scenario.Steps
 	}
@@ -366,6 +443,7 @@ func (a *App) resize(w, h int) {
 		Height:     h,
 		SidePanels: alt && w >= 100,
 		FixedTop:   alt,
+		Scrollback: a.em.Scrollback,
 	}
 }
 
@@ -384,7 +462,6 @@ func (a *App) Run() error {
 	// restart a delay that is already counting, and the only way to be sure of that is
 	// to never touch it once armed.
 	var wake <-chan time.Time
-	var blink <-chan time.Time
 	var disarm <-chan time.Time
 	for !a.quit {
 		if wake == nil && a.barrier == "" && a.next >= len(a.steps) && !a.st.Finished {
@@ -396,33 +473,55 @@ func (a *App) Run() error {
 		if wake == nil {
 			wake = a.arm()
 		}
-		// Armed from what the last draw actually installed, so the loop parks on the other
-		// two channels the moment nothing on the screen moves by itself. Which states those
-		// are is the shine's to decide now: with -shine=false a finished run, a barrier and a
-		// blocked agent all idle at zero CPU rather than repainting eight times a second
-		// forever, and with the shine on — the default — those three are exactly the states
-		// the box glints in, so what parks instead is a half-typed line. The light stands
-		// down once the human is the thing moving, and that is the only quiet state left.
-		if blink == nil && a.animated() {
-			blink = time.After(spinPeriod)
-		}
 		if disarm == nil && a.armed {
 			rem := armTimeout - a.cfg.Now().Sub(a.armedAt)
 			if rem <= 0 {
 				rem = time.Millisecond
 			}
-			disarm = time.After(rem)
+			disarm = a.cfg.After(rem)
 		}
 		select {
+		case m, ok := <-extensionMessages(a.cfg.Extensions):
+			if ok {
+				visual := a.extensionMessage(m)
+				if m.View != nil || m.ViewClosed != "" || m.Removed {
+					a.extRedraw = a.extRedraw || visual
+					if a.extDeadline == nil {
+						a.extDeadline = a.cfg.After(spinPeriod)
+					}
+				} else if visual {
+					if err := a.draw(); err != nil {
+						return err
+					}
+				}
+			}
+		case <-a.extDeadline:
+			a.extDeadline = nil
+			if a.extRedraw {
+				a.extRedraw = false
+				if err := a.draw(); err != nil {
+					return err
+				}
+			}
 		case <-disarm:
 			disarm = nil
-			a.armed = false
-			if err := a.draw(); err != nil {
-				return err
+			if a.armed {
+				a.armed = false
+				if err := a.draw(); err != nil {
+					return err
+				}
 			}
-		case <-blink:
-			blink = nil
-			a.phase++
+		case fired, ok := <-a.animation:
+			if !ok {
+				a.animation = nil
+				continue
+			}
+			now := a.cfg.Now()
+			if now.After(fired) {
+				fired = now
+			}
+			a.advancePhase(fired)
+			a.animation = nil
 			if err := a.draw(); err != nil {
 				return err
 			}
@@ -488,7 +587,7 @@ func (a *App) arm() <-chan time.Time {
 	if a.cfg.Speed != 1 {
 		d = time.Duration(float64(d) / a.cfg.Speed)
 	}
-	return time.After(d)
+	return a.cfg.After(d)
 }
 
 // advance plays one step and reports whether the frame changed. A barrier changes
@@ -514,7 +613,7 @@ func (a *App) advance() bool {
 		a.skip = ""
 		return false
 	}
-	a.st.Apply(s.Event, s.At)
+	a.accepted(s.Event, false)
 	return true
 }
 
@@ -535,8 +634,14 @@ func (a *App) handle(ev term.Event) (bool, error) {
 	switch ev.Kind {
 	case term.EventResize:
 		a.resize(ev.Width, ev.Height)
+		if a.view == viewExtension {
+			a.sendPanelResize()
+		}
 		return true, nil
 	case term.EventPaste:
+		if a.view == viewExtension {
+			return a.panelInput(viewmodel.Input{Kind: "paste", Text: ev.Text}), nil
+		}
 		if a.view == viewConfig {
 			if a.configView != nil && a.configView.editID != "" {
 				a.configView.editor.Insert(configClean(ev.Text))
@@ -556,6 +661,9 @@ func (a *App) handle(ev term.Event) (bool, error) {
 	case term.EventKey:
 		return a.key(ev.Key), nil
 	case term.EventMouse:
+		if a.view == viewExtension {
+			return a.panelMouse(ev.Mouse), nil
+		}
 		// Its own case and not a detour through key, because key owns the interrupt's arm and
 		// clears it on everything else it is handed. A pointer is not a keypress: taking the
 		// door away because the reader reached for the scrollbar would withdraw a promise the
@@ -582,6 +690,13 @@ func (a *App) handle(ev term.Event) (bool, error) {
 // the screen: the row promising that the next press leaves has to come off it.
 func (a *App) key(k term.Key) bool {
 	act := a.km.Lookup(k)
+	if act == ActionQuit {
+		a.quit = true
+		return false
+	}
+	if a.view == viewExtension {
+		return a.panelKey(act, k)
+	}
 	if a.view == viewConfig {
 		return a.configKey(act, k)
 	}
@@ -634,21 +749,31 @@ func (a *App) dispatch(act Action, k term.Key) bool {
 	if a.view != viewConversation {
 		return a.fullViewKey(act)
 	}
-	// If an overlay is open, route keys to it instead of the editor.
+	// First-party modal surfaces outrank extension-owned actions.
 	if a.overlay != nil && a.ovHandler != nil {
 		return a.overlayKey(act, k)
+	}
+	if owner, ok := a.extActions[act]; ok {
+		parts := strings.SplitN(string(act), ":", 3)
+		if len(parts) == 3 {
+			go a.cfg.Extensions.Invoke(owner, parts[2], "")
+		}
+		return true
 	}
 	// If the inline effort slider is open, route keys to it.
 	if a.effortSlider != nil {
 		return a.effortKey(act, k)
 	}
-	// If the slash menu is active, intercept navigation keys.
+	// If the slash menu is active, intercept navigation keys. The scroll actions count as
+	// movement here as they already do in the effort slider and the config view: on a phone
+	// with the mouse released the plain arrows are bound to them, and a menu open on a phone
+	// still has to move.
 	if a.smenu.Active() {
 		switch act {
-		case ActionHistoryPrev:
+		case ActionHistoryPrev, ActionScrollUp:
 			a.smenu = a.smenu.moveUp()
 			return true
-		case ActionHistoryNext:
+		case ActionHistoryNext, ActionScrollDown:
 			a.smenu = a.smenu.moveDown()
 			return true
 		case ActionSubmit:
@@ -671,6 +796,12 @@ func (a *App) dispatch(act Action, k term.Key) bool {
 	switch act {
 	case ActionTeam:
 		a.openTeam()
+		return true
+	case ActionTasks:
+		a.tasksOpen = !a.tasksOpen
+		return true
+	case ActionOutputLevel:
+		a.cycleOutputLevel()
 		return true
 	case ActionQuit:
 		// ctrl+d, and unconditional: a simulator has nothing unsaved, so there is nothing
@@ -885,8 +1016,7 @@ func (a *App) human(typ string, payload any) {
 		Payload: b,
 	}
 	a.seq++
-	a.follow()
-	a.st.Apply(ev, a.clock)
+	a.accepted(ev, true)
 }
 
 // finish marks the log exhausted. The input bar belongs to the human from here on: the
@@ -896,6 +1026,87 @@ func (a *App) finish() {
 	a.st.Finished = true
 	a.st.Active = false
 	a.st.AppendNotice(state.NoticeEndOfLog, "end of scenario")
+}
+
+// outputToastTTL is how long the input's border keeps naming the output level after
+// a change. Long enough to read a three-word notice twice, short enough that it is
+// gone before the reader starts wondering whether it is a mode they are stuck in:
+// the level is a setting that stays until it is changed again, and the border says
+// so only once.
+const outputToastTTL = 2 * time.Second
+
+// cycleOutputLevel steps the transcript through its three detail levels and holds
+// the notice up. The order is compact, standard, full, and back to compact: the
+// levels are a ladder by amount, and a cycle walks a ladder by steps rather than
+// by jumping between its ends.
+func (a *App) cycleOutputLevel() {
+	a.setOutputLevel(a.r.Detail.OrStandard()%ui.DetailFull + 1)
+}
+
+// setOutputLevel moves the transcript to l and tells the reader, once, where they
+// landed. The toggle is honest about position the way a jump is: the change re-wraps
+// the whole conversation — the same items are a different number of rows at a
+// different level — so a row number saved here would name a different sentence
+// after the change. What survives the re-wrap is an item and an offset inside it,
+// and ItemSpans can solve that against either geometry, so the window's top row is
+// re-anchored on the item the reader was reading rather than on where that item
+// used to start.
+//
+// Following the tail — the state a session spends most of its life in — needs none
+// of it: the tail is the tail at every level, and draw keeps the window there.
+func (a *App) setOutputLevel(l ui.DetailLevel) {
+	cur := a.r.Detail.OrStandard()
+	if l == cur {
+		return
+	}
+	anchor, offset := -1, 0
+	if a.scrolled {
+		// A reader away from the tail owns a row of the transcript, and this change
+		// re-wraps the transcript under them. Following the tail needs none of what
+		// follows: the tail is the tail at every level.
+		starts, _ := a.r.ItemSpans(a.st, a.vp)
+		anchor, offset = spanAt(starts, a.top)
+	}
+	a.r.Detail = l
+	if anchor >= 0 {
+		starts, heights := a.r.ItemSpans(a.st, a.vp)
+		if s := starts[anchor]; s >= 0 {
+			// The offset is capped at the item's own height, the one number the two
+			// geometries disagree about: at the fuller level the item is taller and
+			// the reader is exactly where they were, at the sparser one it is shorter
+			// and the cap is what keeps the window from sliding into the item below.
+			a.top = s + max(0, min(offset, heights[anchor]-1))
+		} else {
+			// The item they were reading draws nothing at this level — a thought the
+			// compact level hides. The nearest visible thing below it is where they
+			// were headed; with nothing below, the conversation past the window has
+			// collapsed away entirely, and the honest answer is the tail again.
+			a.top, a.scrolled = 0, false
+			for j := anchor; j < len(starts); j++ {
+				if starts[j] >= 0 {
+					a.top, a.scrolled = starts[j], true
+					break
+				}
+			}
+		}
+	}
+	a.toast = "Output level " + strconv.Itoa(int(l)) + "/3"
+	a.toastUntil = a.cfg.Now().Add(outputToastTTL)
+}
+
+// spanAt names the item a transcript row sits in: the last item that starts at or
+// above the row, and how far into it the row has gone. A row on the blank between
+// two items belongs to the item above it, the item transcript() charged the blank
+// after. (-1, 0) means no visible item reaches that high, which is a window resting
+// on row zero of a conversation whose first item draws nothing.
+func spanAt(starts []int, row int) (int, int) {
+	at, off := -1, 0
+	for i, s := range starts {
+		if s >= 0 && s <= row {
+			at, off = i, row-s
+		}
+	}
+	return at, off
 }
 
 // draw renders and writes. The renderer's chrome is rebuilt every frame because a widget
@@ -922,21 +1133,67 @@ func (a *App) finish() {
 // rectangle the side column ended up in. A press arrives as a bare row and column of the
 // terminal, and these are what turn one into a row of the bar — see the fields, and Frame.Side.
 func (a *App) draw() error {
+	if a.frameNext > 0 && !a.phaseAt.IsZero() {
+		a.advancePhase(a.cfg.Now())
+	}
 	a.sync()
 	if a.view != viewConversation {
+		a.streamed = false
 		var f ui.Frame
 		switch a.view {
 		case viewTeam:
 			f = renderTeam(a.st, a.vp, a.viewTop)
-		case viewTasks:
-			f = renderTasks(a.st, a.vp, a.viewTop, a.r.Glyphs)
 		case viewConfig:
 			f = renderConfig(a.configSnapshot(), a.configView, a.vp)
+		case viewConsent:
+			if len(a.consents) > 0 {
+				f = renderConsent(a.consents[0], a.vp)
+			}
+		case viewExtension:
+			a.sendPanelResize()
+			f = a.renderPanel()
 		}
 		a.viewTop, a.viewRows, a.viewBelow = f.Scroll.Above, f.Scroll.Rows, f.Scroll.Below
+		a.scheduleFrame(f)
 		return a.write(a.em.Emit(f))
 	}
+	// The working verb lives in the input's top border now. While the run works, the
+	// border carries the spinner and the verb on the same shared phase the status row
+	// always indexed, with the status band of light crossing the word; the moment the
+	// turn is the human's, the border gives the title back to whatever the caller set.
+	// The editor's history label outranks both in Render, so walking back through the
+	// history still names the entry rather than the run — History is the older claim
+	// on that border and keeps it.
+	if ui.Working(a.st) {
+		a.ed.Title = a.workTitle()
+		a.ed.TitleShine = a.shine(ui.StatusShine)
+	} else {
+		a.ed.Title = a.cfg.InputTitle
+		a.ed.TitleShine = ui.Shimmer{}
+	}
 	a.ed.Shine = a.inputShine()
+	// The level notice is a transient. Past its moment it comes down whether or not
+	// anything else has happened, which is why the expiry is checked here and not in
+	// the keypress that raised it: a session where nothing moves would otherwise
+	// hold the notice up forever, and a notice that never leaves is a title.
+	if !a.toastUntil.IsZero() && !a.cfg.Now().Before(a.toastUntil) {
+		a.toast, a.toastUntil = "", time.Time{}
+	}
+	a.ed.Hint = a.toast
+	// Back on the conversation after something else painted the screen: the window's
+	// rows have to be laid back down before any more of them are committed, because a
+	// scroll carries whatever the screen's top is holding and right now that is the
+	// visitor's rows. One seam frame — the window parked at the row history ends on,
+	// painted over the visitor — puts them back; the frame below then scrolls the rows
+	// the window has grown past into history as if the visit had never happened.
+	if a.em.Scrollback && !a.streamed {
+		seam := a.vp
+		seam.Scrolled, seam.ScrollTop = true, a.top
+		if err := a.write(a.em.Emit(a.r.Render(a.st, a.ed, seam))); err != nil {
+			return err
+		}
+	}
+	a.streamed = true
 	a.r.Widgets = a.chrome()
 	a.r.Overlay = a.overlay
 	a.vp.Scrolled, a.vp.ScrollTop = a.scrolled, a.top
@@ -946,7 +1203,53 @@ func (a *App) draw() error {
 	if f.Scroll.Below == 0 {
 		a.scrolled = false
 	}
+	a.scheduleFrame(f)
 	return a.write(a.em.Emit(f))
+}
+
+func (a *App) advancePhase(at time.Time) {
+	if a.phaseAt.IsZero() {
+		return
+	}
+	if at.Before(a.phaseAt) {
+		at = a.cfg.Now()
+	}
+	elapsed := at.Sub(a.phaseAt) / spinPeriod
+	if elapsed < 1 {
+		elapsed = 1
+	}
+	a.phase += int(elapsed)
+	a.phaseAt = at
+}
+
+// scheduleFrame replaces the previous frame's visual deadline. A stable frame
+// pauses the shared phase; a moving one is anchored now and gets one one-shot wake.
+//
+// The toast's own deadline is a visual deadline too: the frame that takes the
+// notice down has to be drawn even though nothing on screen is moving, so its wake
+// is armed beside the animation's and the sooner of the two fires. A wake that
+// arrives early only redraws and re-arms; the deadline is re-read against the clock
+// every schedule, so the notice comes down at its ttl rather than at a tick count
+// taken when it went up.
+func (a *App) scheduleFrame(f ui.Frame) {
+	now := a.cfg.Now()
+	a.frameNext = f.NextVisualChange
+	a.animation = nil
+	next := time.Duration(0)
+	if a.frameNext > 0 {
+		next = time.Duration(a.frameNext) * spinPeriod
+		a.phaseAt = now
+	} else {
+		a.phaseAt = time.Time{}
+	}
+	if !a.toastUntil.IsZero() {
+		if d := a.toastUntil.Sub(now); d > 0 && (next <= 0 || d < next) {
+			next = d
+		}
+	}
+	if next > 0 {
+		a.animation = a.cfg.After(next)
+	}
 }
 
 // scroll moves the window n rows, negative for up, and reports whether the frame has to be
@@ -958,11 +1261,24 @@ func (a *App) draw() error {
 // scrolling, and from where the view already is — a.top is the tail offset the last frame
 // reported, so the first press moves by one row rather than jumping to the top of the log.
 //
+// scroll moves the reading position by n rows and reports whether the frame has to be
+// drawn again.
+//
 // The bottom is not clamped here on purpose. Asking for a row past the end is a page key
 // near the tail, and the renderer answers with the last window and reports the offset it
 // used; clamping it twice, once here against a row count we would have to recompute, is how
 // the two clamps disagree.
+//
+// On a scrollback surface it answers no at any distance, and so do the movers below it.
+// The reading position there is the terminal's own history, and the terminal takes no
+// requests: there is no sequence that scrolls somebody else's view, and a window that
+// moved back over committed rows would print them twice. The keys stay bound — the keymap
+// does not fork for a surface — and the swipe is the scroll, which on the one surface
+// these fire on is the scroll there is.
 func (a *App) scroll(n int) bool {
+	if a.em.Scrollback {
+		return false
+	}
 	if !a.scrolled && (n >= 0 || a.top == 0) {
 		return false
 	}
@@ -1194,7 +1510,7 @@ func (a *App) fast(k term.Key, dir int) int {
 // screen, whether that is because the human scrolled there or because the whole transcript
 // fits, and in both cases there is nothing above to move to.
 func (a *App) toTop() bool {
-	if a.top == 0 {
+	if a.em.Scrollback || a.top == 0 {
 		return false
 	}
 	a.scrolled, a.top = true, 0
@@ -1205,7 +1521,7 @@ func (a *App) toTop() bool {
 // it is also the way back from anywhere: one key, no arithmetic, and new rows resume
 // arriving on screen.
 func (a *App) follow() bool {
-	if !a.scrolled {
+	if a.em.Scrollback || !a.scrolled {
 		return false
 	}
 	a.scrolled = false
@@ -1237,6 +1553,9 @@ func (a *App) follow() bool {
 // Finding nothing does nothing — there is no next turn to go to — which leaves the frame
 // alone instead of nudging the offset to a row the next frame would take away again.
 func (a *App) jump(dir int) bool {
+	if a.em.Scrollback {
+		return false
+	}
 	target := -1
 	for _, row := range a.r.PromptRows(a.st, a.vp) {
 		switch {
@@ -1339,39 +1658,104 @@ func (a *App) shine(key string) ui.Shimmer {
 // a light sweeping under a half-typed sentence competes with their own cursor for the eye,
 // and the thing it was there to announce has already happened.
 //
-// Slower(2) is the one place the two bands differ, and the multiplication is here rather than
-// in the config so that a reader who sets [anim] period still moves both. The pass itself is
-// untouched — the band crosses the box at exactly the speed it crosses the verb — and only the
-// wait between passes doubles, to something near ten seconds. The reason is what each band is
-// attached to: the verb is a word the reader is watching for news, where a glint every five
-// seconds reads as a pulse; the box is a shape their eyes rest on between turns, where the same
-// rate is a blink in the corner of the room. Twice is the number the reader asked for.
+// The input keeps the same visible pass as the status shimmer. Slower(2) creates
+// its established cadence, then LongerRest(4) multiplies only that cadence's dark
+// interval: eight visible ticks and 288 dark ticks with the shipped values.
 func (a *App) inputShine() ui.Shimmer {
 	if ui.Working(a.st) || !a.ed.Empty() {
 		return ui.Shimmer{}
 	}
-	return a.shine(ui.InputShine).Slower(2)
+	return a.shine(ui.InputShine).Slower(2).LongerRest(4)
 }
 
-// chrome is the widget list for this frame: what the state demands, then what the
-// player adds on top. ui.ChromeFor is a call and not something Render does by
-// itself, which is what makes this list the single place a config will later be
-// allowed to reorder or veto.
-func (a *App) chrome() []ui.Widget {
-	out := ui.ChromeFor(a.st)
-	if len(a.st.Tasks) > 0 {
-		out = append(out, ui.TasksWidget{St: a.st})
-	}
+// workTitle is what the input's top border says while the run works: the spinner's
+// frame on the shared clock and the verb. The same vocabulary the status row used,
+// moved rather than rewritten.
+func (a *App) workTitle() string {
+	return ui.SpinnerFrame(a.phase, a.r.Glyphs) + " working"
+}
+
+// workQuiet reports whether the working verb has somewhere else to be this frame.
+// It has whenever the input's border exists and will actually draw the title —
+// HostsTitle is the widget's own fit test, so a terminal too narrow for the word
+// keeps the verb in the bottom row instead of dropping it between the two homes.
+func (a *App) workQuiet() bool {
+	return ui.Working(a.st) && a.ed.HostsTitle(a.workTitle(), a.vp.Width, a.r.Glyphs)
+}
+
+// A compositionStep is one row of the chrome: a name — the stable ID of the widget or
+// widgets it installs, and the word a [layout] table will be allowed to say — the slot
+// those widgets ask for, and a builder that answers what this frame wants from it. A
+// builder that returns nothing is a row the frame has no use for this time; the gates
+// that decide so live inside the builder, so a step is read as one piece rather than as
+// a question about a function that lives somewhere else.
+//
+// Some builders act and not only ask: effort hands its slider the animation tick,
+// and the armed notice retires an arm that has timed out. The list is walked in
+// order and the builders run in order, which is what keeps those effects where the
+// hand-written chrome had them — build order is behaviour, not an implementation
+// detail the day a builder clears a field a later builder would have read. A
+// [layout] table may reorder or veto what is installed, but the builders still all
+// run, in this order, whatever it says.
+//
+// The slot is declared here rather than asked of the built widget so that the
+// vocabulary a config may address — name and slot together — is data, readable
+// without an App to build against. TestTheCompositionNamesItsWidgets pins the
+// declaration against the widgets' own answers, so the two cannot drift.
+type compositionStep struct {
+	name  string
+	slot  ui.Slot
+	build func(*App) []ui.Widget
+}
+
+// defaultComposition is the widget list for a frame, in the order it is installed:
+// what the state demands, then what the player adds on top. It is the data form of
+// the composition chrome() used to write by hand, and its default order is today's
+// order byte for byte — pinned by TestTheDefaultCompositionIsToday, which is the
+// test any reordering has to argue with.
+//
+// The inventory this sits in, so nobody has to go find it again: the list is built
+// at the two install sites, the draw loop and Fold (both `a.r.Widgets = a.chrome()`),
+// and consumed at the renderer's two Place sites — slot(), which stacks every widget
+// that resolved into a row slot, and side(), which hands the right column to the
+// first widget that claims it and leaves any second one out.
+//
+// The names are the widget's own Name(), asserted against it by the same test, and
+// the vocabulary is closed: every name is unique, which is what a [layout] row
+// addresses. It was not always so — the end-of-scenario notice and the armed
+// interrupt both used to be "notice" — and the split is a spec decision
+// (spec/look.md): the end of the scenario keeps the generic name, and the armed
+// second-press warning is "interrupt", its own row under the input.
+var defaultComposition = []compositionStep{
+	// What the state itself demands, which today is the one open question. ui.ChromeFor
+	// stays the owner of that question — see its comment for why the status row is
+	// deliberately not among its answers.
+	{"approval", ui.SlotBelowInput, func(a *App) []ui.Widget { return ui.ChromeFor(a.st) }},
+	// The Tasks panel, fixed above the input: the summary line collapsed, the
+	// bounded list dropped down. Either state renders nothing at all when the run
+	// has no tasks, so a recording without task events costs the frame nothing.
+	{"tasks", ui.SlotAboveInput, func(a *App) []ui.Widget {
+		if len(a.st.Tasks) == 0 {
+			return nil
+		}
+		return []ui.Widget{ui.TasksWidget{St: a.st, Open: a.tasksOpen}}
+	}},
 	// The inline effort slider, above the input, while the human is picking a level.
-	if a.effortSlider != nil {
+	{"effort", ui.SlotBelowInput, func(a *App) []ui.Widget {
+		if a.effortSlider == nil {
+			return nil
+		}
 		a.effortSlider.Phase = a.phase
-		out = append(out, EffortWidget{Slider: a.effortSlider})
-	}
+		return []ui.Widget{EffortWidget{Slider: a.effortSlider}}
+	}},
 	// The slash suggestion dropdown, above the input, while the human is typing
 	// a command name.
-	if a.smenu.Active() {
-		out = append(out, SlashMenuWidget{Menu: a.smenu})
-	}
+	{"slashmenu", ui.SlotBelowInput, func(a *App) []ui.Widget {
+		if !a.smenu.Active() {
+			return nil
+		}
+		return []ui.Widget{SlashMenuWidget{Menu: a.smenu}}
+	}},
 	// The pinned header, and the one place the rule "only while scrolled" is written down. A
 	// reader following the tail is looking at their own last message a few rows up; a reader
 	// who has scrolled away is not, and the header exists for exactly that gap. So it is not
@@ -1386,11 +1770,15 @@ func (a *App) chrome() []ui.Widget {
 	// a.top is the offset the last frame actually used, which is also the offset this frame
 	// will be built with — draw sets the pair from these fields and Render only disagrees when
 	// it clamps, which the following frame has already corrected.
-	if a.scrolled {
-		if t, n := a.r.PromptInside(a.st, a.vp, a.top); n > 0 {
-			out = append(out, ui.HeaderWidget{Text: t, Rows: n})
+	{"header", ui.SlotTop, func(a *App) []ui.Widget {
+		if !a.scrolled {
+			return nil
 		}
-	}
+		if t, n := a.r.PromptInside(a.st, a.vp, a.top); n > 0 {
+			return []ui.Widget{ui.HeaderWidget{Text: t, Rows: n}}
+		}
+		return nil
+	}},
 	// The scrollbar, on the same terms as the header and for the same reason, one layer down:
 	// the widget asks for the right slot, and Place leaves it out wherever a side column cannot
 	// be held — which inline mode cannot, because a column down the edge of scrollback would be
@@ -1407,35 +1795,57 @@ func (a *App) chrome() []ui.Widget {
 	// built fresh every frame and a drag spans many, so whoever is tracking the pointer is the
 	// only thing that can say the thumb is under a finger right now. Its scroll numbers arrive
 	// the other way about, from the renderer, for the reason ScrollReader gives.
-	out = append(out, ui.ScrollbarWidget{Held: a.dragging})
-	if a.st.Finished {
-		// The key is asked of the keymap rather than written out here, so the sentence names
-		// whatever the reader's own [keys] table binds instead of whatever we shipped. It can
-		// bind nothing at all — ActionNone takes a default away — and then the notice stops
-		// after the half of it that is still true, because naming no key beats naming a key
-		// that does not leave.
+	{"scrollbar", ui.SlotRight, func(a *App) []ui.Widget {
+		return []ui.Widget{ui.ScrollbarWidget{Held: a.dragging}}
+	}},
+	// The end-of-scenario notice. The key is asked of the keymap rather than written out
+	// here, so the sentence names whatever the reader's own [keys] table binds instead of
+	// whatever we shipped. It can bind nothing at all — ActionNone takes a default away —
+	// and then the notice stops after the half of it that is still true, because naming no
+	// key beats naming a key that does not leave.
+	{"notice", ui.SlotBelowInput, func(a *App) []ui.Widget {
+		if !a.st.Finished {
+			return nil
+		}
 		leave := "the input bar is yours"
 		if k := a.km.KeyFor(ActionQuit); k != "" {
 			leave += ", " + k + " to leave"
 		}
-		out = append(out, ui.NoticeWidget{Text: "end of scenario — " + leave})
-	}
+		return []ui.Widget{ui.NoticeWidget{Text: "end of scenario — " + leave}}
+	}},
 	// The armed interrupt, said out loud, which is what keeps the second press from being
 	// folklore: the reader has just watched their line vanish, and the row under the input
 	// tells them what the same key does now. KeyFor cannot answer "" here — the arm is only
 	// ever raised by a key that looked up to ActionInterrupt, so at least that binding
 	// exists — and if a config binds several, any of them is a true answer, because the
 	// second press is matched on the action and not on the key.
-	if a.armed {
+	//
+	// The row is an InterruptWidget rather than the NoticeWidget it draws so that its
+	// config name is its own: "interrupt" in a [layout] list, where the end-of-scenario
+	// notice is "notice". Two rows that could not be told apart were two rows a layout
+	// could not address, and spec/look.md settles the split here rather than in the
+	// spec's silence.
+	{"interrupt", ui.SlotBelowInput, func(a *App) []ui.Widget {
+		if !a.armed {
+			return nil
+		}
 		if a.cfg.Now().Sub(a.armedAt) > armTimeout {
 			a.armed = false
-		} else {
-			out = append(out, ui.NoticeWidget{
-				Text: "press " + a.km.KeyFor(ActionInterrupt) + " again to leave",
-				Warn: true,
-			})
+			return nil
 		}
-	}
+		return []ui.Widget{InterruptWidget{NoticeWidget: ui.NoticeWidget{
+			Text: "press " + a.km.KeyFor(ActionInterrupt) + " again to leave",
+			Warn: true,
+		}}}
+	}},
+	// The recap widget, shown above the input after a response finishes. It is
+	// only installed when state.Recap is true and the agent is no longer active.
+	{"recap", ui.SlotAboveInput, func(a *App) []ui.Widget {
+		if !a.st.Recap || ui.Working(a.st) || len(a.st.Items) == 0 {
+			return nil
+		}
+		return []ui.Widget{ui.RecapWidget{St: a.st}}
+	}},
 	// The status row is installed here and not by ChromeFor because its phase comes from
 	// this loop's wall clock, which no state field carries — and so does its band of light,
 	// which is the same argument twice. It is handed in unconditionally: the widget draws it
@@ -1445,32 +1855,171 @@ func (a *App) chrome() []ui.Widget {
 	// Last in the list, which for a bottom-slot widget is only tidiness — but it is also the
 	// order a config will be allowed to rewrite, and last is where a row that summarizes the
 	// others belongs.
-	// The recap widget, shown above the input after a response finishes. It is
-	// only installed when state.Recap is true and the agent is no longer active.
-	if a.st.Recap && !ui.Working(a.st) && len(a.st.Items) > 0 {
-		out = append(out, ui.RecapWidget{St: a.st})
-	}
-	return append(out, ui.StatusWidget{St: a.st, Phase: a.phase, Shine: a.shine(ui.StatusShine)})
+	//
+	// Quiet because the working verb — its spinner and its band of light with it — moved
+	// into the input's top border, and a bottom row repeating it would be the same news
+	// twice on one screen. The other rungs of the ladder stay here: blocked, waiting, done
+	// and idle are states the border says nothing about.
+	{"status", ui.SlotBottom, func(a *App) []ui.Widget {
+		return []ui.Widget{ui.StatusWidget{St: a.st, Phase: a.phase, Shine: a.shine(ui.StatusShine), Quiet: a.workQuiet()}}
+	}},
 }
 
-// animated reports whether anything on screen moves on its own. It reads the widget list
-// and the band the last draw installed rather than rebuilding either: the question is about
-// the frame the human is looking at, and rebuilding would make asking cost as much as
-// drawing.
-//
-// The editor is asked separately because it is the one drawable in ui that is not a Widget —
-// it owns the human's line rather than a rectangle of chrome — and its shine is the only
-// thing about it that ever moves without an event.
-func (a *App) animated() bool {
-	if a.ed.Animated() {
-		return true
+// InterruptWidget is the armed-interrupt notice under its own name. It draws exactly
+// what ui.NoticeWidget draws — it is one, embedded — and answers "interrupt" to the
+// one question that matters here: what a config calls this row. The end-of-scenario
+// notice keeps the generic name because it is the generic row; this one is a specific
+// warning with a specific remedy, and a reader vetoing it wants this one and not the
+// other.
+type InterruptWidget struct {
+	ui.NoticeWidget
+}
+
+func (InterruptWidget) Name() string { return "interrupt" }
+
+// WidgetDecl is one row of the composition's vocabulary: the name a [layout] list
+// writes, the slot the row asks for, and a line of documentation for `arxi-sim keys`.
+type WidgetDecl struct {
+	Name string
+	Slot ui.Slot
+	Doc  string
+}
+
+// CompositionWidgets is the widget vocabulary a [layout] table may name, in
+// composition order. It is the same closed list the config parser checks against, so
+// a name a file may write is a name this program draws, or the file is refused.
+func CompositionWidgets() []WidgetDecl {
+	out := make([]WidgetDecl, len(defaultComposition))
+	for i, step := range defaultComposition {
+		out[i] = WidgetDecl{Name: step.name, Slot: step.slot, Doc: widgetDocs[step.name]}
 	}
-	for _, wd := range a.r.Widgets {
-		if wd.Animated() {
-			return true
+	return out
+}
+
+// widgetDocs is the one-line answer to "what is this row", printed by `arxi-sim keys`
+// beside each name. It lives beside the vocabulary it documents, and not on the step
+// itself, because the composition is the interface's skeleton — order, slots, gates —
+// while this is its label.
+var widgetDocs = map[string]string{
+	"approval":  "the pending approval question, under the input",
+	"tasks":     "the task panel above the input, collapsed or dropped down",
+	"effort":    "the inline effort slider while a level is being picked",
+	"slashmenu": "the slash command dropdown while a command is being typed",
+	"header":    "the pinned header, while the transcript is scrolled",
+	"scrollbar": "the scrollbar beside the transcript",
+	"notice":    "the end-of-scenario notice",
+	"interrupt": "the armed warning that a second press leaves",
+	"recap":     "the recap of the turn, after a response finishes",
+	"status":    "the status row at the foot of the frame",
+}
+
+// LayoutOverride is one [layout] row as parsed: the slot it addresses, at most one
+// condition under which it applies, and the ordered widget names. Width > 0 means the
+// row applies only while the terminal is narrower than that many columns; Height > 0
+// only while the frame is shorter than that many rows; both zero is the unconditional
+// row. Names may be empty — that is a veto, the slot's rows left out entirely.
+type LayoutOverride struct {
+	Slot   ui.Slot
+	Width  int
+	Height int
+	Names  []string
+}
+
+// layoutFor resolves the overrides against a frame's geometry: per slot, the winning
+// row's names, or nil when no row addressed the slot and the composition's own order
+// stands. The rules are spec/look.md's, and the one that is not obvious from the code
+// is the tie: among matching rows of one kind the narrowest bracket wins, and a
+// matching height row beats a matching width row, because height is the scarcer axis —
+// the transcript scrolls and the chrome stacks.
+//
+// h <= 0 is a fold — a document with no screen — and no height row matches there; a
+// width row still can, against the width the fold will be printed at.
+func layoutFor(overrides []LayoutOverride, w, h int) map[ui.Slot][]string {
+	var out map[ui.Slot][]string
+	best := map[ui.Slot]LayoutOverride{}
+	for _, o := range overrides {
+		if o.Width > 0 && !(w > 0 && w < o.Width) {
+			continue
+		}
+		if o.Height > 0 && !(h > 0 && h < o.Height) {
+			continue
+		}
+		cur, ok := best[o.Slot]
+		if !ok || tierRank(o) > tierRank(cur) {
+			best[o.Slot] = o
 		}
 	}
-	return false
+	for slot, o := range best {
+		if out == nil {
+			out = map[ui.Slot][]string{}
+		}
+		out[slot] = o.Names
+	}
+	return out
+}
+
+// tierRank orders two matching rows: height beats width, and within a kind the
+// narrower bracket beats the wider. A rank of 0 is the unconditional row, which any
+// matching tier outranks.
+func tierRank(o LayoutOverride) int {
+	switch {
+	case o.Height > 0:
+		return (1 << 20) + o.Height
+	case o.Width > 0:
+		return o.Width
+	}
+	return 0
+}
+
+// chrome is the widget list for this frame: the composition, walked in order — and,
+// when a [layout] table spoke, re-stacked per slot by what it said. The builders run
+// in the default order either way, because build order is behaviour (effort's tick,
+// the arm's expiry); a layout may only change which built widgets are installed, and
+// in what order within their slot. With no layout the walk is the whole answer, which
+// is the byte-identical default the composition goldens pin.
+func (a *App) chrome() []ui.Widget {
+	var out []ui.Widget
+	if len(a.layout) == 0 {
+		for _, step := range defaultComposition {
+			out = append(out, step.build(a)...)
+		}
+		return out
+	}
+	built := map[string][]ui.Widget{}
+	slots := []ui.Slot{} // first-appearance order, so unnamed slots stay deterministic
+	for _, step := range defaultComposition {
+		built[step.name] = step.build(a)
+		if len(slots) == 0 || slots[len(slots)-1] != step.slot {
+			slots = appendUniqueSlot(slots, step.slot)
+		}
+	}
+	resolved := layoutFor(a.layout, a.vp.Width, a.vp.Height)
+	for _, slot := range slots {
+		names, ok := resolved[slot]
+		if !ok {
+			// No row addressed this slot, or none matched: the composition's own
+			// order stands, restricted to this slot.
+			for _, step := range defaultComposition {
+				if step.slot == slot {
+					out = append(out, built[step.name]...)
+				}
+			}
+			continue
+		}
+		for _, name := range names {
+			out = append(out, built[name]...)
+		}
+	}
+	return out
+}
+
+func appendUniqueSlot(slots []ui.Slot, s ui.Slot) []ui.Slot {
+	for _, have := range slots {
+		if have == s {
+			return slots
+		}
+	}
+	return append(slots, s)
 }
 
 // Fold applies the whole scenario at once and returns the frame it produces. It is what
@@ -1504,8 +2053,6 @@ func (a *App) State() *state.State { return a.st }
 
 func (a *App) openTeam() { a.openFullView(viewTeam) }
 
-func (a *App) openTasks() { a.openFullView(viewTasks) }
-
 func (a *App) openFullView(view appView) {
 	a.view = view
 	a.viewTop = 0
@@ -1515,6 +2062,25 @@ func (a *App) openFullView(view appView) {
 func (a *App) closeFullView() { a.view = viewConversation }
 
 func (a *App) fullViewKey(act Action) bool {
+	if a.view == viewConsent && len(a.consents) > 0 {
+		current := a.consents[0]
+		switch act {
+		case ActionApprove:
+			if err := a.cfg.Extensions.Grant(current.Name); err != nil {
+				a.st.AppendNotice(state.NoticeQuiescent, current.Name+": "+err.Error())
+				return true
+			}
+		case ActionDeny, ActionCancel:
+			a.cfg.Extensions.Reject(current.Name)
+		default:
+			return false
+		}
+		a.consents = a.consents[1:]
+		if len(a.consents) == 0 {
+			a.closeFullView()
+		}
+		return true
+	}
 	switch act {
 	case ActionCancel, ActionInterrupt:
 		a.closeFullView()
@@ -1639,13 +2205,28 @@ func (a *App) runSlash(cmd, args string) bool {
 		a.openTeam()
 		return true
 	case "tasks":
-		a.openTasks()
+		a.tasksOpen = !a.tasksOpen
 		return true
 	case "config", "settings":
 		a.openConfig()
 		return true
+	case "panels":
+		names := a.panelNames()
+		text := "No extension panels."
+		if len(names) > 0 {
+			text = "Extension panels: " + strings.Join(names, ", ")
+		}
+		a.st.AppendNotice(state.NoticeQuiescent, text)
+		return true
+	case "panel":
+		return a.openPanel(parsePanelName(args))
 	case "recap":
 		a.st.Recap = !a.st.Recap
+		return true
+	}
+	if strings.HasPrefix(cmd, "ext:") && a.cfg.Extensions != nil {
+		name := strings.TrimPrefix(cmd, "ext:")
+		go a.cfg.Extensions.Invoke(name, "", args)
 		return true
 	}
 	return false

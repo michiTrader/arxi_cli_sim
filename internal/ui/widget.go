@@ -37,6 +37,34 @@ type Widget interface {
 	Render(w, h int, g Glyphs) []Line
 }
 
+// VisualScheduler is the precise animation contract. A positive result is the
+// number of shared ticks until the drawable may next look different; zero means
+// stable. It is optional so existing widgets retain their one-tick Animated cadence.
+type VisualScheduler interface {
+	NextVisualChange() int
+}
+
+type animationReporter interface {
+	Animated() bool
+}
+
+func visualChange(v animationReporter) int {
+	if precise, ok := v.(VisualScheduler); ok {
+		return max(0, precise.NextVisualChange())
+	}
+	if v.Animated() {
+		return 1
+	}
+	return 0
+}
+
+func sooner(current, candidate int) int {
+	if candidate > 0 && (current == 0 || candidate < current) {
+		return candidate
+	}
+	return current
+}
+
 // Place decides where a widget actually goes.
 func Place(wd Widget, vp Viewport) (Slot, bool) {
 	s := wd.Slot()
@@ -72,19 +100,54 @@ func ChromeFor(st *state.State) []Widget {
 	return out
 }
 
-// TasksWidget summarizes the live task list beside the input. It is a value over
-// State rather than a cached count, so every frame reflects the latest task event.
-type TasksWidget struct{ St *state.State }
+// tasksPanelIndent is the two columns of air at the left of the whole panel — header,
+// rows and count alike — so the list sits inside the frame instead of welded to the
+// first cell of the terminal, the way the reference the reader approved drew it.
+const tasksPanelIndent = 2
+
+// tasksPanelRows is the most task rows the open panel will spend on itself: enough
+// that a run with a handful of tasks shows them all at once, few enough that a
+// hundred-task recording cannot take the screen away from the conversation the
+// panel is a neighbour of. Tasks beyond it are counted, not shown — the "… +N" row
+// is the panel's whole answer to a list longer than itself.
+const tasksPanelRows = 6
+
+// TasksWidget summarizes the live task list above the input. Collapsed it is one
+// line of counts; open it is the bounded panel the toggle keys drop down, with the
+// active and pending tasks first and the ones that did not fit counted in an
+// "… +N" row. It is a value over State rather than a cached count, so every frame
+// reflects the latest task event.
+type TasksWidget struct {
+	St *state.State
+
+	// Open drops the panel down. False — the default — draws the summary line only.
+	Open bool
+}
 
 func (TasksWidget) Name() string   { return "tasks" }
 func (TasksWidget) Slot() Slot     { return SlotAboveInput }
 func (TasksWidget) Fallback() Slot { return SlotBelowInput }
 func (TasksWidget) Animated() bool { return false }
 
-func (tw TasksWidget) Render(w, _ int, _ Glyphs) []Line {
+func (tw TasksWidget) Render(w, h int, g Glyphs) []Line {
 	if tw.St == nil || len(tw.St.Tasks) == 0 || w <= 0 {
 		return nil
 	}
+	if !tw.Open {
+		if row := tw.summary(w); row != nil {
+			return []Line{row}
+		}
+		return nil
+	}
+	return tw.panel(w, h, g)
+}
+
+// summary is the collapsed widget and the panel's header alike: one row of counts that
+// degrades from the right as the terminal narrows, so the same line introduces both
+// states and a toggle never moves what the reader was reading. The words are the
+// reader's — done, in progress, open — and not the event vocabulary, because this row
+// is a sentence about the run and not a legend for the glyphs.
+func (tw TasksWidget) summary(w int) Line {
 	completed, active, pending := 0, 0, 0
 	for _, task := range tw.St.Tasks {
 		if task == nil {
@@ -100,19 +163,105 @@ func (tw TasksWidget) Render(w, _ int, _ Glyphs) []Line {
 		}
 	}
 	total := len(tw.St.Tasks)
+	head := fmt.Sprintf("Tasks %d", total)
 	variants := []Line{
-		{{Text: fmt.Sprintf("Tasks %d/%d", completed, total), Style: "tasks.summary"}, {Text: fmt.Sprintf(" · %d active · %d pending · ", active, pending), Style: "tasks.meta"}, {Text: "/tasks", Style: "tasks.action"}},
-		{{Text: fmt.Sprintf("Tasks %d/%d", completed, total), Style: "tasks.summary"}, {Text: fmt.Sprintf(" · %d active · ", active), Style: "tasks.meta"}, {Text: "/tasks", Style: "tasks.action"}},
-		{{Text: fmt.Sprintf("Tasks %d/%d · ", completed, total), Style: "tasks.summary"}, {Text: "/tasks", Style: "tasks.action"}},
-		{{Text: fmt.Sprintf("Tasks %d/%d", completed, total), Style: "tasks.summary"}},
+		{{Text: head + fmt.Sprintf(" (%d done, %d in progress, %d open)", completed, active, pending), Style: "tasks.summary"}, {Text: " · ", Style: "tasks.meta"}, {Text: "/tasks", Style: "tasks.action"}},
+		{{Text: head + fmt.Sprintf(" (%d done, %d in progress)", completed, active), Style: "tasks.summary"}, {Text: " · ", Style: "tasks.meta"}, {Text: "/tasks", Style: "tasks.action"}},
+		{{Text: head + fmt.Sprintf(" (%d done)", completed), Style: "tasks.summary"}, {Text: " · ", Style: "tasks.meta"}, {Text: "/tasks", Style: "tasks.action"}},
+		{{Text: head, Style: "tasks.summary"}},
 		{{Text: "Tasks", Style: "tasks.summary"}},
 	}
 	for _, row := range variants {
-		if row.Width() <= w {
-			return []Line{row.TrimRight()}
+		if row.Width()+tasksPanelIndent <= w {
+			return append(Line{pad(tasksPanelIndent)}, row...).TrimRight()
 		}
 	}
 	return nil
+}
+
+// panel is the open state: the summary as a header, then one row per task, active
+// first and completed last, creation order kept within each group. The height is
+// capped twice — by tasksPanelRows always, and by the screen when the slot cannot
+// afford the full panel — and whatever does not fit is counted rather than shown.
+// A screen too short to hold the panel, or a width too narrow to hold one task row,
+// keeps only the summary, which is the row that says there is something to open.
+func (tw TasksWidget) panel(w, h int, g Glyphs) []Line {
+	var out []Line
+	if row := tw.summary(w); row != nil {
+		out = append(out, row)
+	}
+	if h > 0 && h <= 2 {
+		return out
+	}
+	lead := ansi.StringWidth(strings.Repeat(" ", tasksPanelIndent) + g.Get("tasks.active") + " ")
+	if w <= lead {
+		return out
+	}
+	ordered := tw.ordered()
+	maxRows := tasksPanelRows
+	if h > 0 {
+		// The header above and the count row below: on a screen that cannot hold
+		// even the summary, a task and the number of what is hidden, the summary
+		// is what survives.
+		maxRows = min(maxRows, max(1, h-2))
+	}
+	shown := min(len(ordered), maxRows)
+	if len(ordered) > shown && shown > 1 {
+		shown-- // keep the last row for the count of what did not fit
+	}
+	for _, task := range ordered[:shown] {
+		out = append(out, taskPanelRow(task, w, g))
+	}
+	if n := len(ordered) - shown; n > 0 {
+		out = append(out, append(Line{pad(tasksPanelIndent)}, Span{Text: fmt.Sprintf("… +%d", n), Style: "tasks.meta"}).TrimRight())
+	}
+	return out
+}
+
+// ordered puts the tasks in the order the panel shows them: active above pending
+// above completed, and creation order within each group. It never sorts in place —
+// State.Tasks is the recording's order and every other reader of it depends on that.
+func (tw TasksWidget) ordered() []*state.Task {
+	var out []*state.Task
+	for _, rank := range []event.TaskStatus{event.TaskActive, event.TaskPending, event.TaskCompleted} {
+		for _, task := range tw.St.Tasks {
+			if task != nil && task.Status == rank {
+				out = append(out, task)
+			}
+		}
+	}
+	return out
+}
+
+// taskPanelRow is one task as a panel row: a status glyph and the title, cut from
+// the right. The panel is a neighbour of the conversation, not a monitor of it, so
+// an owner or a detail that does not fit is left to the events that produced it.
+func taskPanelRow(task *state.Task, w int, g Glyphs) Line {
+	_, glyph, style := taskLook(task.Status, g)
+	lead := strings.Repeat(" ", tasksPanelIndent) + glyph + " "
+	room := max(0, w-ansi.StringWidth(lead))
+	title := task.Title
+	if ansi.StringWidth(title) > room {
+		title = ansi.Truncate(title, room, "")
+	}
+	if title == "" {
+		return Line{pad(tasksPanelIndent), {Text: glyph, Style: style}} // a lead alone is better than a trailing blank
+	}
+	return Line{pad(tasksPanelIndent), {Text: lead[tasksPanelIndent:], Style: style}, {Text: title, Style: "tasks.title"}}.TrimRight()
+}
+
+// taskLook is the panel's vocabulary for a status: the glyph and the theme key it
+// is drawn in. It mirrors the ladder the transcript's task blocks use, so the same
+// status is the same colour wherever it is read.
+func taskLook(status event.TaskStatus, g Glyphs) (text, glyph, style string) {
+	switch status {
+	case event.TaskActive:
+		return "active", g.Get("tasks.active"), "tasks.active"
+	case event.TaskCompleted:
+		return "completed", g.Get("tasks.completed"), "tasks.completed"
+	default:
+		return "pending", g.Get("tasks.pending"), "tasks.pending"
+	}
 }
 
 // ApprovalWidget asks the question that is blocking the run. It sits under the
@@ -570,6 +719,15 @@ type StatusWidget struct {
 	// this widget's, because the two animations need not be in step — though in the player
 	// they are, since one counter feeds both.
 	Shine Shimmer
+
+	// Quiet hands the working verb over to the input's top border, where the spinner and
+	// its band of light live instead. The other rungs of the ladder — blocked, waiting,
+	// done, idle — are drawn here as always, and the metadata around an empty verb is
+	// drawn without it rather than dropped: the row still says what the run costs while
+	// the border says what the run is doing. The caller sets this only when the border
+	// exists to host the verb; on a terminal too narrow for the box the verb stays in
+	// the row, because a moved indicator that lands nowhere is a lost one.
+	Quiet bool
 }
 
 func (StatusWidget) Name() string { return "status" }
@@ -586,6 +744,14 @@ func (StatusWidget) Fallback() Slot { return "" }
 // no clause of its own: it is drawn on the verb "working", which is on the screen in
 // exactly the frames this is already true in.
 func (s StatusWidget) Animated() bool { return s.spins() }
+
+// NextVisualChange is one tick while the spinner is visible and stable otherwise.
+func (s StatusWidget) NextVisualChange() int {
+	if s.spins() {
+		return 1
+	}
+	return 0
+}
 
 // spins is the verb ladder's "working" branch spelled out. Written this way rather
 // than as Active alone, Animated and Render cannot disagree: a frame that says
@@ -658,15 +824,21 @@ func statusRow(segments []Line, w int, g Glyphs) Line {
 	room := w - bottomMargin
 	sep := Span{Text: " " + g.Get("status.sep") + " ", Style: "status.sep"}
 	row, used := Line{}, 0
-	for i, seg := range segments {
+	for _, seg := range segments {
+		// A rung that handed its verb to the input's border comes back as an empty
+		// segment, and an empty one is skipped whole: no separator is spent on it and
+		// the row opens on the segment that follows, not on air.
+		if len(seg) == 0 {
+			continue
+		}
 		cost := seg.Width()
-		if i > 0 {
+		if used > 0 {
 			cost += ansi.StringWidth(sep.Text)
 		}
 		if used+cost > room {
 			break
 		}
-		if i > 0 {
+		if used > 0 {
 			row = append(row, sep)
 		}
 		row, used = append(row, seg...), used+cost
@@ -761,7 +933,7 @@ func (s StatusWidget) provenanceRow(w int) Line {
 	if branchText != "" {
 		pathRoom -= ansi.StringWidth(branchText)
 		if st.CWD != "" {
-			pathRoom -= 3
+			pathRoom -= 1
 		}
 	}
 	path := st.CWD
@@ -774,7 +946,7 @@ func (s StatusWidget) provenanceRow(w int) Line {
 	}
 	if branchText != "" && ansi.StringWidth(branchText) <= room-row.Width() {
 		if len(row) > 0 {
-			row = append(row, Span{Text: "   "})
+			row = append(row, Span{Text: " "})
 		}
 		row = append(row, Span{Text: branchText, Style: "status.dim"})
 	}
@@ -801,7 +973,7 @@ func (s StatusWidget) memberCluster(g Glyphs) Line {
 		case m.Error != "":
 			glyph, style = g.Get("status.member.failed"), "status.member.failed"
 		case m.Busy:
-			glyph, style = s.frame(g), "status.member.busy"
+			glyph, style = SpinnerFrame(s.Phase, g), "status.member.busy"
 		}
 		if glyph != "" {
 			out = append(out, Span{Text: glyph, Style: style})
@@ -818,16 +990,13 @@ func (s StatusWidget) memberCluster(g Glyphs) Line {
 // finished run that is blocked says what it is blocked on, because that is the useful
 // half — the notice one row up already says the recording ended, and repeating it here
 // would spend the widest row on the screen agreeing with its neighbour.
+//
+// Quiet empties the working rung rather than re-laddering it. An empty segment is
+// skipped by statusRow, so the row goes on to the metadata without a leading
+// separator — the head is a segment like any other now, not a promise that the row
+// opens with a verb.
 func (s StatusWidget) head(g Glyphs) Line {
 	out := Line{}
-	// An emptied spinner cycle contributes no span at all rather than the bare space its
-	// frame would have been followed by: an indent with nothing in it moves the verb a
-	// column to the right for a reason no reader can see.
-	if s.spins() {
-		if f := s.frame(g); f != "" {
-			out = append(out, Span{Text: f + " ", Style: "status.spinner"})
-		}
-	}
 	st := s.St
 	switch {
 	case st.Blocked != nil:
@@ -839,9 +1008,17 @@ func (s StatusWidget) head(g Glyphs) Line {
 	case st.Quiescent != "":
 		return append(out, Span{Text: "waiting", Style: "status.verb"})
 	case st.Active:
+		if s.Quiet {
+			// The verb, the spinner and the shine are in the input's border this
+			// frame; here they would be a second copy of the same news.
+			return out
+		}
 		// The one place a shine is drawn in this row, and the band is measured against the
 		// word rather than the terminal: seven columns, so what crosses them is a glint on a
 		// word and not a wave that happens to be passing through the left of the screen.
+		if f := SpinnerFrame(s.Phase, g); f != "" {
+			out = append(out, Span{Text: f + " ", Style: "status.spinner"})
+		}
 		verb := Line{{Text: "working", Style: "status.verb"}}
 		return append(out, s.Shine.Apply(verb, verb.Width())...)
 	case st.Finished:
@@ -850,17 +1027,20 @@ func (s StatusWidget) head(g Glyphs) Line {
 	return append(out, Span{Text: "idle", Style: "status.verb"})
 }
 
-// frame picks the spinner's rune out of the whole declared cycle. The index is by rune
-// and not by byte: every frame of the default is a three-byte braille cell, so a byte
-// index would cut one in thirds and put a replacement character in the corner of the
-// screen. An override with no runes in it disables the spinner instead of panicking,
-// which is the same answer NewGlyphs gives an empty value everywhere else.
-func (s StatusWidget) frame(g Glyphs) string {
+// SpinnerFrame is frame `phase` of the spinner cycle, or empty when the cycle has no
+// frames. It is exported because the working verb now has two homes — this row and,
+// in the player, the input's top border — and both must turn on the same clock and
+// the same vocabulary rather than agree to disagree. The index is by rune and not by
+// byte: every frame of the default is a three-byte braille cell, so a byte index
+// would cut one in thirds. An override with no runes in it draws nothing instead of
+// panicking on a zero modulus, the same answer NewGlyphs gives an empty value
+// everywhere else.
+func SpinnerFrame(phase int, g Glyphs) string {
 	frames := []rune(g.Get("status.spinner"))
 	if len(frames) == 0 {
 		return ""
 	}
-	i := s.Phase % len(frames)
+	i := phase % len(frames)
 	if i < 0 {
 		i += len(frames)
 	}

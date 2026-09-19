@@ -17,6 +17,13 @@ import (
 type Renderer struct {
 	Glyphs Glyphs
 
+	// Detail is the output level the transcript draws at, one of the Detail
+	// constants. Its zero value is the standard level, which is what a Renderer
+	// nobody told about levels has always drawn; the app sets it, and a keypress
+	// changes it, because the level is a fact about the reader's wish for this
+	// frame and not about the state the frame is drawn from.
+	Detail DetailLevel
+
 	// Widgets are the chrome the app installs. The transcript is not in here;
 	// everything else is.
 	Widgets []Widget
@@ -61,23 +68,31 @@ func (r *Renderer) Render(st *state.State, in *Input, vp Viewport) Frame {
 	// below the transcript answers to the frame instead: the input's border, the status line and
 	// the notices are the foot of the window, not neighbours of the prose.
 	var top []Line
+	var topChanges []visualRange
 	if vp.FixedTop {
-		top = r.slot(SlotTop, vp, tw)
+		top, topChanges = r.slot(SlotTop, vp, tw)
 	}
-	above := r.slot(SlotAboveInput, vp, vp.Width)
-	below := r.slot(SlotBelowInput, vp, vp.Width)
-	bottom := r.slot(SlotBottom, vp, vp.Width)
+	above, aboveChanges := r.slot(SlotAboveInput, vp, vp.Width)
+	below, belowChanges := r.slot(SlotBelowInput, vp, vp.Width)
+	bottom, bottomChanges := r.slot(SlotBottom, vp, vp.Width)
 
 	var inputRows []Line
 	cur := Cursor{Hidden: true}
 	gap := 0
+	// A row of air between the transcript and the widgets above the input: the last
+	// line of prose and the first line of chrome are about different things, and a
+	// recap or task list butted against the prose reads as a continuation of it.
+	sep := 0
+	if len(above) > 0 {
+		sep = 1
+	}
 	if in != nil {
 		if len(rows) > 0 || len(top) > 0 || len(above) > 0 {
 			gap = 1
 		}
 		inputRows, cur = in.Render(vp.Width, r.Glyphs)
 	}
-	chrome := len(top) + len(above) + gap + len(inputRows) + len(below) + len(bottom)
+	chrome := len(top) + len(above) + sep + gap + len(inputRows) + len(below) + len(bottom)
 
 	// Committed rows are rows the terminal keeps for good, and while a session is
 	// running there are none.
@@ -129,7 +144,28 @@ func (r *Renderer) Render(st *state.State, in *Input, vp Viewport) Frame {
 		}
 	}
 	first := len(rows) - keep
-	if vp.Scrolled {
+	if vp.Scrollback {
+		if vp.Scrolled {
+			// The caller's seam: this exact row at the top of the window, clamped only by
+			// the log itself. A seam is how the window is laid back onto the screen after
+			// something else painted over it, and it may end short of the tail — the rows
+			// under it are the ones about to be committed, and the frame after this one
+			// moves the window down over them.
+			first = min(vp.ScrollTop, len(rows))
+		} else {
+			// The tail, and never behind it. History is written from the screen's top row,
+			// so the top may not retreat over a row that is already history: ScrollTop is
+			// the floor the caller keeps at the last window top, and a screen that grew —
+			// a keyboard closed on a phone — would otherwise walk the top back over rows
+			// the history holds. The window then comes out shorter than the screen, and
+			// the fill below the input bar takes up the difference, the way a young
+			// conversation always has.
+			first = len(rows) - keep
+			if floor := min(vp.ScrollTop, len(rows)); floor > first {
+				first = floor
+			}
+		}
+	} else if vp.Scrolled {
 		first = vp.ScrollTop
 		if last := len(rows) - keep; first > last {
 			first = last
@@ -143,6 +179,7 @@ func (r *Renderer) Render(st *state.State, in *Input, vp Viewport) Frame {
 		window = window[:keep]
 	}
 	f.Scroll = Scroll{Above: first, Below: len(rows) - first - len(window), Rows: keep}
+	f.Scrollback = vp.Scrollback
 
 	// Where that column is, for whoever has to turn a pointer into a row of it. The rows are the
 	// window's own, so this is empty on every frame the column is — and it cannot be stale by the
@@ -169,7 +206,8 @@ func (r *Renderer) Render(st *state.State, in *Input, vp Viewport) Frame {
 	// past that Line's length where nobody reads — but it is invisible by accident, not by rule:
 	// the day a block renders its rows by slicing one buffer, row i's spare capacity is row i+1's
 	// spans, and every frame after the first draws the last frame's bar. Copying costs one row.
-	if col := r.side(vp, len(window), f.Scroll); len(col) > 0 {
+	if col, next := r.side(vp, len(window), f.Scroll); len(col) > 0 {
+		f.NextVisualChange = sooner(f.NextVisualChange, next)
 		for i := range window {
 			if i >= len(col) || len(col[i]) == 0 {
 				continue
@@ -182,7 +220,14 @@ func (r *Renderer) Render(st *state.State, in *Input, vp Viewport) Frame {
 		}
 	}
 
-	live := append(append([]Line{}, top...), window...)
+	var changes []visualRange
+	live := append([]Line{}, top...)
+	changes = appendVisualRanges(changes, topChanges, 0)
+	live = append(live, window...)
+	changes = appendVisualRanges(changes, aboveChanges, len(live))
+	if sep > 0 {
+		live = append(live, Line{})
+	}
 	live = append(live, above...)
 	if in != nil {
 		if gap > 0 {
@@ -190,11 +235,16 @@ func (r *Renderer) Render(st *state.State, in *Input, vp Viewport) Frame {
 		}
 		cur.Line += len(live)
 		f.Cursor = cur
+		if len(inputRows) > 0 {
+			changes = append(changes, visualRange{len(live), len(live) + len(inputRows), visualChange(in)})
+		}
 		live = append(live, inputRows...)
 	} else {
 		f.Cursor = cur
 	}
+	changes = appendVisualRanges(changes, belowChanges, len(live))
 	live = append(live, below...)
+	changes = appendVisualRanges(changes, bottomChanges, len(live))
 	live = append(live, bottom...)
 
 	// Then fill the screen out to its height, because a frame that stops short is a
@@ -229,8 +279,24 @@ func (r *Renderer) Render(st *state.State, in *Input, vp Viewport) Frame {
 		// visible, which is a later row of the same prompt.
 		if d := len(live) - vp.Height; d > 0 {
 			live = live[d:]
+			changes = trimVisualRanges(changes, d)
 			f.Cursor.Line = max(0, f.Cursor.Line-d)
+			// On a scrollback surface the trim has to say what it ate, because the emitter
+			// commits the rows the screen's top leaves behind and the screen's top has just
+			// moved. Window rows eaten are rows the screen no longer shows and history is
+			// about to hold, and naming them keeps the commit exact. Once the trim reaches
+			// the chrome the top of the screen is not a transcript row at all, and no honest
+			// answer exists — a negative Above stands the emitter down until a frame that
+			// fits names a real row again.
+			if vp.Scrollback {
+				if cut := min(d, len(window)); cut == d {
+					f.Scroll.Above += d
+				} else {
+					f.Scroll.Above = -1
+				}
+			}
 		}
+		f.NextVisualChange = visualRangesNext(changes, len(live))
 	}
 	f.Live = Composite(live, r.Overlay, vp.Width, r.Glyphs)
 	return f
@@ -270,6 +336,33 @@ func (r *Renderer) transcript(st *state.State, width int) ([]Line, []int) {
 		rows = append(rows, lines...)
 	}
 	return rows, starts
+}
+
+// ItemSpans reports where every item lands: the row each item's first content line
+// starts on, and the rows its own content wrapped to. starts is transcript()'s own
+// answer, an item that drew nothing at -1, and heights[i] is the length of the same
+// layout transcript charged to that item — the blank between two items belongs to
+// neither, so the two never sum past the next start.
+//
+// It exists for the one caller that moves the reading position across a change that
+// re-flows the whole transcript. A detail-level toggle adds and removes rows in the
+// middle of the conversation, so a row number saved before the change names a
+// different sentence after it; an item index and an offset inside that item survive
+// the re-wrap, and can be solved against the new geometry for the same place. The
+// measurement is fresh for the same reason PromptRows' is: the same items at a
+// different level or a different width are different rows, and a cached row survives
+// neither as a right answer.
+func (r *Renderer) ItemSpans(st *state.State, vp Viewport) (starts, heights []int) {
+	width := TranscriptWidth(vp)
+	if st == nil || width <= 0 {
+		return nil, nil
+	}
+	_, starts = r.transcript(st, width)
+	heights = make([]int, len(st.Items))
+	for i, it := range st.Items {
+		heights[i] = len(r.blockLines(it, width))
+	}
+	return starts, heights
 }
 
 // PromptRows is where the reader's own turns are, in the rows Frame.Scroll counts.
@@ -352,15 +445,23 @@ func (r *Renderer) PromptInside(st *state.State, vp Viewport, row int) (string, 
 
 // blockLines renders one item, through the cache when the item can no longer
 // change. The key carries the width because a cached line is only valid for the
-// width it was wrapped to, and an item with no id is never cached at all: a cache
-// keyed on a shared id draws the second item with the first one's text, which is a
-// corrupt transcript, whereas re-wrapping it costs a few microseconds.
+// width it was wrapped to, and the output level beside it for the same reason:
+// two levels of one item are two different answers, and a cache that could not
+// tell them apart would draw the level the reader just left. An item with no id is
+// never cached at all: a cache keyed on a shared id draws the second item with the
+// first one's text, which is a corrupt transcript, whereas re-wrapping it costs a
+// few microseconds.
 func (r *Renderer) blockLines(it state.Item, width int) []Line {
+	level := r.Detail.OrStandard()
 	b := BlockFor(it)
+	if ib, ok := b.(ItemBlock); ok {
+		ib.Detail = level
+		b = ib
+	}
 	if !b.Sealed() || it.ID == "" {
 		return b.Render(width, r.Glyphs)
 	}
-	key := it.ID + "|" + strconv.Itoa(int(it.Kind)) + "|" + strconv.Itoa(width)
+	key := it.ID + "|" + strconv.Itoa(int(it.Kind)) + "|" + strconv.Itoa(int(level)) + "|" + strconv.Itoa(width)
 	if lines, ok := r.memo[key]; ok {
 		return lines
 	}
@@ -389,16 +490,60 @@ func (r *Renderer) blockLines(it state.Item, width int) []Line {
 // restyled or switched off from a config, and this layer is the one that has to
 // stay handable to a user. ChromeFor is that logic, now callable by whoever owns
 // the list.
-func (r *Renderer) slot(s Slot, vp Viewport, w int) []Line {
+type visualRange struct {
+	from, to int
+	next     int
+}
+
+func appendVisualRanges(dst, src []visualRange, offset int) []visualRange {
+	for _, change := range src {
+		change.from += offset
+		change.to += offset
+		dst = append(dst, change)
+	}
+	return dst
+}
+
+func trimVisualRanges(changes []visualRange, rows int) []visualRange {
+	out := changes[:0]
+	for _, change := range changes {
+		change.from -= rows
+		change.to -= rows
+		if change.to > 0 {
+			change.from = max(0, change.from)
+			out = append(out, change)
+		}
+	}
+	return out
+}
+
+func visualRangesNext(changes []visualRange, height int) int {
+	next := 0
+	for _, change := range changes {
+		if change.next > 0 && change.from < height && change.to > 0 {
+			next = sooner(next, change.next)
+		}
+	}
+	return next
+}
+
+func (r *Renderer) slot(s Slot, vp Viewport, w int) ([]Line, []visualRange) {
 	var out []Line
+	var changes []visualRange
 	for _, wd := range r.Widgets {
 		got, ok := Place(wd, vp)
 		if !ok || got != s {
 			continue
 		}
-		out = append(out, wd.Render(w, vp.Height, r.Glyphs)...)
+		rows := wd.Render(w, vp.Height, r.Glyphs)
+		if len(rows) == 0 {
+			continue
+		}
+		from := len(out)
+		out = append(out, rows...)
+		changes = append(changes, visualRange{from, len(out), visualChange(wd)})
 	}
-	return out
+	return out, changes
 }
 
 // side is the column beside the transcript, h rows tall, or nothing.
@@ -418,10 +563,10 @@ func (r *Renderer) slot(s Slot, vp Viewport, w int) []Line {
 // pinned row above it and re-deriving every landmark against a left edge that is no longer
 // column zero. There is no widget asking for that yet, and untested generality is worse than
 // a stated limit.
-func (r *Renderer) side(vp Viewport, h int, sc Scroll) []Line {
+func (r *Renderer) side(vp Viewport, h int, sc Scroll) ([]Line, int) {
 	w := sideWidth(vp)
 	if w <= 0 || h <= 0 {
-		return nil
+		return nil, 0
 	}
 	for _, wd := range r.Widgets {
 		got, ok := Place(wd, vp)
@@ -431,7 +576,11 @@ func (r *Renderer) side(vp Viewport, h int, sc Scroll) []Line {
 		if sr, ok := wd.(ScrollReader); ok {
 			wd = sr.WithScroll(sc)
 		}
-		return wd.Render(w, h, r.Glyphs)
+		rows := wd.Render(w, h, r.Glyphs)
+		if len(rows) == 0 {
+			return nil, 0
+		}
+		return rows, visualChange(wd)
 	}
-	return nil
+	return nil, 0
 }

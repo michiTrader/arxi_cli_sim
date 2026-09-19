@@ -1,180 +1,177 @@
 package app
 
 import (
-	"bytes"
+	"io"
 	"strings"
 	"testing"
 
 	"arxi.local/sim/internal/event"
 	"arxi.local/sim/internal/state"
-	"arxi.local/sim/internal/term"
 	"arxi.local/sim/internal/ui"
 )
 
 func tasksFixture() *state.State {
 	return &state.State{Tasks: []*state.Task{
-		{ID: "task-1", Title: "Trace stale session cache", Detail: "Find where the old token survives rotation.", Owner: "scout", Status: event.TaskCompleted},
-		{ID: "task-2", Title: "Invalidate the cache entry", Detail: "Delete the process cache key after storage succeeds.", Owner: "builder", Status: event.TaskActive},
-		{ID: "task-3", Title: "Run the focused regression test", Detail: "Verify rotation reads the new token.", Owner: "reviewer", Status: event.TaskPending},
+		{ID: "task-1", Title: "Trace stale session cache", Owner: "scout", Status: event.TaskCompleted},
+		{ID: "task-2", Title: "Invalidate the cache entry", Owner: "builder", Status: event.TaskActive},
+		{ID: "task-3", Title: "Run the focused regression test", Owner: "reviewer", Status: event.TaskPending},
 	}}
 }
 
-func TestTasksFrameBuildsLiveTaskList(t *testing.T) {
-	st := tasksFixture()
-	f := renderTasks(st, ui.Viewport{Width: 80, Height: 14}, 0, ui.DefaultGlyphs())
-	got := f.Plain()
-	for _, want := range []string{
-		"Tasks  1/3 completed · 1 active · 1 pending", "completed  Trace stale session cache", "owner scout",
-		"active  Invalidate the cache entry", "pending  Run the focused regression test", "Esc back",
-	} {
-		if !strings.Contains(got, want) {
-			t.Errorf("Tasks frame does not contain %q:\n%s", want, got)
-		}
-	}
-	if len(f.Live) != 14 || !f.Cursor.Hidden || len(f.Committed) != 0 {
-		t.Fatalf("frame geometry = live %d hidden %v committed %d", len(f.Live), f.Cursor.Hidden, len(f.Committed))
-	}
-	st.Tasks[1].Status = event.TaskCompleted
-	st.Tasks[1].Detail = "Changed after the first render."
-	live := renderTasks(st, ui.Viewport{Width: 80, Height: 14}, 0, ui.DefaultGlyphs()).Plain()
-	if !strings.Contains(live, "2/3 completed") || !strings.Contains(live, "Changed after the first render.") {
-		t.Fatalf("Tasks frame retained a stale snapshot:\n%s", live)
-	}
+func tasksEmitter() *ui.Emitter {
+	return &ui.Emitter{Theme: ui.DefaultTheme(), Mode: ui.ModeInline, Profile: ui.ProfileMono}
 }
 
-func TestTasksFrameFitsResponsiveSurfaces(t *testing.T) {
-	for _, width := range []int{20, 31, 48, 72} {
-		for _, height := range []int{1, 2, 3, 8} {
-			f := renderTasks(tasksFixture(), ui.Viewport{Width: width, Height: height}, 1000, ui.DefaultGlyphs())
-			if len(f.Live) != height {
-				t.Errorf("%dx%d: live=%d", width, height, len(f.Live))
-			}
-			if bad := f.Overflow(); len(bad) != 0 {
-				t.Errorf("%dx%d overflows at %v:\n%s", width, height, bad, f.Plain())
-			}
-			for _, row := range f.Live {
-				if strings.HasSuffix(row.Text(), " ") {
-					t.Errorf("%dx%d has trailing space in %q", width, height, row.Text())
-				}
-			}
-		}
-	}
+// tasksFrameText renders the conversation the way draw would and returns it as text.
+// The assertions below are about which rows the panel contributes and in what order,
+// which the frame answers directly; reading them out of emitted bytes would make every
+// claim hostage to the escape sequences the emitter folds between spans.
+func tasksFrameText(t *testing.T, a *App) string {
+	t.Helper()
+	a.r.Widgets = a.chrome()
+	a.ed.Shine = a.inputShine()
+	a.vp.Scrolled, a.vp.ScrollTop = a.scrolled, a.top
+	f := a.r.Render(a.st, a.ed, a.vp)
+	return f.Plain()
 }
 
-func TestTasksFrameHandlesNoTasksAtEveryHeight(t *testing.T) {
-	for _, st := range []*state.State{nil, state.New()} {
-		for height := 0; height <= 4; height++ {
-			f := renderTasks(st, ui.Viewport{Width: 40, Height: height}, 1000, ui.DefaultGlyphs())
-			if len(f.Live) != height {
-				t.Errorf("state %p height %d: live=%d", st, height, len(f.Live))
-			}
-			if bad := f.Overflow(); len(bad) != 0 {
-				t.Errorf("state %p height %d overflows at %v:\n%s", st, height, bad, f.Plain())
-			}
-		}
-	}
-	if got := renderTasks(state.New(), ui.Viewport{Width: 40, Height: 4}, 0, ui.DefaultGlyphs()).Plain(); !strings.Contains(got, "No tasks in this run.") {
-		t.Fatalf("empty Tasks view = %q", got)
-	}
-}
-
-func TestTasksFrameScrollsCreationOrder(t *testing.T) {
-	st := tasksFixture()
-	first := renderTasks(st, ui.Viewport{Width: 31, Height: 5}, 0, ui.DefaultGlyphs())
-	if first.Scroll.Below == 0 || !strings.Contains(first.Plain(), "Trace stale") {
-		t.Fatalf("first window = %+v\n%s", first.Scroll, first.Plain())
-	}
-	last := renderTasks(st, ui.Viewport{Width: 31, Height: 5}, 1000, ui.DefaultGlyphs())
-	if last.Scroll.Below != 0 || last.Scroll.Above == 0 || !strings.Contains(last.Plain(), "owner reviewer") {
-		t.Fatalf("last window = %+v\n%s", last.Scroll, last.Plain())
-	}
-}
-
-func TestTasksDrawUsesCurrentFoldedState(t *testing.T) {
-	var out bytes.Buffer
-	em := &ui.Emitter{Theme: ui.DefaultTheme(), Mode: ui.ModeInline, Profile: ui.ProfileMono}
-	a := New(Config{Width: 80, Height: 10, Out: &out, Emitter: em})
+// TestTasksToggleViaSlashAndKey is the whole contract of the two entry points: both
+// flip the same fixed panel between the summary and the dropped list, and neither
+// opens a second surface the other does not know about.
+func TestTasksToggleViaSlashAndKey(t *testing.T) {
+	a := New(Config{Width: 80, Height: 24})
 	a.st = tasksFixture()
-	a.openTasks()
-	if err := a.draw(); err != nil {
-		t.Fatal(err)
-	}
-	if got := out.String(); !strings.Contains(got, "Trace") || !strings.Contains(got, "Invalidate") {
-		t.Fatalf("draw did not emit current Tasks list: %q", got)
-	}
-}
-
-func TestTasksViewKeyIsolationAndConversationRestoration(t *testing.T) {
-	a := New(Config{Width: 31, Height: 5})
-	a.st = tasksFixture()
-	a.ed.Insert("draft")
-	a.scrolled, a.top = true, 7
-	a.openTasks()
-	if a.view != viewTasks {
-		t.Fatal("Tasks view did not open")
-	}
-	if err := a.draw(); err != nil {
-		t.Fatal(err)
-	}
-	before := a.ed.Text()
-	if a.dispatch(ActionSubmit, mustKey(t, "enter")) {
-		t.Fatal("enter changed Tasks view")
-	}
-	a.dispatch(ActionNone, term.Key{Type: term.KeyRunes, Runes: []rune{'x'}})
-	if a.ed.Text() != before {
-		t.Fatalf("Tasks key mutated editor: %q", a.ed.Text())
-	}
-	if !a.dispatch(ActionEnd, mustKey(t, "end")) || a.viewTop == 0 {
-		t.Fatalf("end did not move local Tasks scroll: top=%d below=%d", a.viewTop, a.viewBelow)
-	}
-	if !a.dispatch(ActionHome, mustKey(t, "home")) || a.viewTop != 0 {
-		t.Fatalf("home did not restore local Tasks top: %d", a.viewTop)
-	}
-	if !a.dispatch(ActionPageDown, mustKey(t, "pgdown")) || a.viewTop == 0 {
-		t.Fatalf("page down did not move local Tasks scroll: %d", a.viewTop)
-	}
-	a.dispatch(ActionCancel, mustKey(t, "esc"))
-	if a.view != viewConversation || !a.scrolled || a.top != 7 || a.ed.Text() != "draft" {
-		t.Fatalf("conversation not restored: view=%v scroll=%v/%d text=%q", a.view, a.scrolled, a.top, a.ed.Text())
-	}
-}
-
-func TestTasksViewInterruptClosesWithoutArmingQuit(t *testing.T) {
-	a := New(Config{Width: 40, Height: 8})
-	a.openTasks()
-	if !a.dispatch(ActionInterrupt, mustKey(t, "ctrl+c")) {
-		t.Fatal("ctrl+c did not close Tasks view")
-	}
-	if a.view != viewConversation || a.armed || a.quit {
-		t.Fatalf("interrupt left view=%v armed=%v quit=%v", a.view, a.armed, a.quit)
-	}
-}
-
-func TestSlashTasksUsesFreshDedicatedView(t *testing.T) {
-	a := New(Config{Width: 72, Height: 24})
-	a.openTasks()
-	a.viewTop = 9
-	a.closeFullView()
+	a.tasksOpen = false // the default-open panel is pinned in its own test below
 	a.ed.Insert("/tasks")
-	if !a.dispatch(ActionSubmit, mustKey(t, "enter")) || a.view != viewTasks || a.viewTop != 0 {
-		t.Fatal("/tasks did not use fresh dedicated Tasks entry")
+	if !a.dispatch(ActionSubmit, mustKey(t, "enter")) || !a.tasksOpen {
+		t.Fatal("/tasks did not drop the panel down")
 	}
-	if _, ok := DefaultBindings()["ctrl+shift+t"]; ok {
+	a.ed.Insert("/tasks")
+	a.dispatch(ActionSubmit, mustKey(t, "enter"))
+	if a.tasksOpen {
+		t.Fatal("/tasks did not collapse the panel back to the summary")
+	}
+	if got := DefaultBindings()["ctrl+t"]; got != ActionTasks {
+		t.Fatalf("ctrl+t = %q, want the tasks action", got)
+	}
+	if _, taken := DefaultBindings()["ctrl+shift+t"]; taken {
 		t.Fatal("Tasks acquired an unrequested default shortcut")
 	}
+	if !a.dispatch(ActionTasks, mustKey(t, "ctrl+t")) || !a.tasksOpen {
+		t.Fatal("the tasks action did not drop the panel down")
+	}
+	if !a.dispatch(ActionTasks, mustKey(t, "ctrl+t")) || a.tasksOpen {
+		t.Fatal("the tasks action did not collapse the panel")
+	}
 }
 
-func TestTasksGlyphsAreDrawnAndDeclared(t *testing.T) {
+// TestTasksPanelOpenByDefault pins the starting state: a run that ships tasks opens
+// with the panel dropped down, because the summary alone made the reader press a key
+// to find out what the run is doing. It opens over nothing when there are no tasks —
+// the widget draws nil for an empty list — so the default costs the empty run nothing.
+func TestTasksPanelOpenByDefault(t *testing.T) {
+	a := New(Config{Width: 80, Height: 24, Out: io.Discard, Emitter: tasksEmitter()})
+	if !a.tasksOpen {
+		t.Fatal("the panel does not start open")
+	}
+	a.st = tasksFixture()
+	if got := tasksFrameText(t, a); !strings.Contains(got, "◼ Invalidate the cache entry") {
+		t.Fatalf("a fresh run does not show the dropped list:\n%s", got)
+	}
+}
+
+// TestTasksPanelDrawsAndCollapses asserts both states against the rendered frame,
+// because the widget being installed is not the claim — the claim is what a reader
+// sees. Collapsed, the panel is the summary line and nothing else; open, every task
+// is on the screen above the input and the ordering is the panel's own: active first,
+// then pending, then completed, whatever order the events arrived in.
+func TestTasksPanelDrawsAndCollapses(t *testing.T) {
+	a := New(Config{Width: 80, Height: 24, Out: io.Discard, Emitter: tasksEmitter()})
+	a.st = tasksFixture()
+	a.tasksOpen = false
+	collapsed := tasksFrameText(t, a)
+	if !strings.Contains(collapsed, "Tasks 3 (1 done, 1 in progress, 1 open)") {
+		t.Fatalf("the collapsed panel does not carry the summary:\n%s", collapsed)
+	}
+	if strings.Contains(collapsed, "Invalidate the cache entry") {
+		t.Fatal("the collapsed panel leaked the task list")
+	}
+	a.tasksOpen = true
+	open := tasksFrameText(t, a)
+	for _, want := range []string{
+		"Invalidate the cache entry", "Run the focused regression test", "Trace stale session cache",
+	} {
+		if !strings.Contains(open, want) {
+			t.Errorf("the open panel is missing %q:\n%s", want, open)
+		}
+	}
+	active := strings.Index(open, "Invalidate")
+	pending := strings.Index(open, "Run the focused")
+	completed := strings.Index(open, "Trace stale")
+	if active > pending || pending > completed {
+		t.Errorf("panel order is active %d, pending %d, completed %d — the active task must lead", active, pending, completed)
+	}
+}
+
+// TestTasksPanelCountsWhatDoesNotFit is the "… +N" row: the panel is bounded, and a
+// list longer than the bound is counted rather than truncated in silence.
+func TestTasksPanelCountsWhatDoesNotFit(t *testing.T) {
+	st := &state.State{}
+	for i := 0; i < 8; i++ {
+		st.Tasks = append(st.Tasks, &state.Task{Title: "task", Status: event.TaskPending})
+	}
+	a := New(Config{Width: 80, Height: 24, Out: io.Discard, Emitter: tasksEmitter()})
+	a.st = st
+	a.tasksOpen = true
+	if got := tasksFrameText(t, a); !strings.Contains(got, "… +3") {
+		t.Fatalf("the open panel does not count the tasks it left out:\n%s", got)
+	}
+}
+
+// TestTasksPanelGlyphsAreDrawnAndDeclared keeps the panel on the same glyph
+// vocabulary as the task blocks in the transcript: the same three status glyphs,
+// none invented and none missing.
+func TestTasksPanelGlyphsAreDrawnAndDeclared(t *testing.T) {
 	g := ui.DefaultGlyphs()
 	g.Track = true
-	_ = renderTasks(tasksFixture(), ui.Viewport{Width: 80, Height: 14}, 0, g)
-	got := strings.Join(g.Used(), ",")
+	a := New(Config{Width: 80, Height: 24, Out: io.Discard, Emitter: tasksEmitter(), Glyphs: &g})
+	a.st = tasksFixture()
+	a.tasksOpen = true
+	if got := tasksFrameText(t, a); !strings.Contains(got, "Invalidate") {
+		t.Fatalf("the open panel drew no tasks:\n%s", got)
+	}
+	used := strings.Join(g.Used(), ",")
 	for _, key := range []string{"tasks.active", "tasks.completed", "tasks.pending"} {
-		if !strings.Contains(got, key) {
-			t.Errorf("Tasks view did not draw glyph %q; used %v", key, g.Used())
+		if !strings.Contains(used, key) {
+			t.Errorf("the panel did not draw glyph %q; used %v", key, used)
 		}
 	}
 	if unknown := g.Unknown(); len(unknown) != 0 {
-		t.Fatalf("Tasks view requested unknown glyphs: %v", unknown)
+		t.Fatalf("the panel requested unknown glyphs: %v", unknown)
+	}
+}
+
+// TestTasksWithoutTasksStaysHidden pins the cost of the panel on a run with no task
+// events: nothing. Neither state may draw a frame of chrome for an empty list.
+func TestTasksWithoutTasksStaysHidden(t *testing.T) {
+	a := New(Config{Width: 80, Height: 24, Out: io.Discard, Emitter: tasksEmitter()})
+	a.tasksOpen = true
+	if got := tasksFrameText(t, a); strings.Contains(got, "Tasks") {
+		t.Fatalf("an empty run drew a Tasks panel:\n%s", got)
+	}
+}
+
+// TestTasksKeyMutatesNothingButThePanel keeps ctrl+t out of the editor's way: the
+// toggle is a view action, and a half-typed line survives it untouched.
+func TestTasksKeyMutatesNothingButThePanel(t *testing.T) {
+	a := New(Config{Width: 80, Height: 24})
+	a.st = tasksFixture()
+	a.tasksOpen = false
+	a.ed.Insert("draft")
+	if !a.dispatch(ActionTasks, mustKey(t, "ctrl+t")) || !a.tasksOpen {
+		t.Fatal("ctrl+t did not drop the panel")
+	}
+	if a.ed.Text() != "draft" {
+		t.Fatalf("ctrl+t mutated the editor: %q", a.ed.Text())
 	}
 }

@@ -144,7 +144,7 @@ func DefaultTheme() *Theme {
 		// marker and the text exactly as they were before the band existed.
 		"prompt.band": {BG: MustHex("#2c2c31")},
 
-		"thinking.marker":  {FG: fuchsia, Attrs: AttrDim},
+		"thinking.marker":  {FG: Idx(Bright + White)},
 		"thinking.text":    {Attrs: AttrDim | AttrItalic},
 		"thinking.summary": dim,
 
@@ -190,6 +190,16 @@ func DefaultTheme() *Theme {
 		"tool.result.text":    dim,
 		"tool.result.error":   {FG: Idx(Red)},
 		"tool.result.gap":     {FG: Idx(Bright + Black), Attrs: AttrDim},
+		// The compact level's whole vocabulary. The two words take the colour the
+		// result's own summary would have taken, so a call means the same thing at
+		// every level and only the amount of it changes; the counts take the sign
+		// colours the diff itself is drawn in, because they are that diff with its
+		// rows folded away, and a count in the added colour says "added" without
+		// spending a word on it.
+		"tool.status.error":  {FG: Idx(Red)},
+		"tool.status.denied": {FG: Idx(Red)},
+		"tool.count.add":     {FG: Idx(Bright + Green)},
+		"tool.count.del":     {FG: Idx(Bright + Red)},
 
 		// The bands are the one place the shipped theme has to name an RGB colour
 		// (here and at prompt.band, which is the same mechanism spent on a turn the
@@ -239,8 +249,12 @@ func DefaultTheme() *Theme {
 		"notice.text":   dim,
 		"notice.warn":   {FG: amber},
 
-		"input.frame":       {FG: Idx(Bright + Black)},
-		"input.title":       {FG: Idx(Bright + Black), Attrs: AttrDim},
+		"input.frame": {FG: Idx(Bright + Black)},
+		"input.title": {FG: Idx(Bright + Black), Attrs: AttrDim},
+		// The notice rides the same grey as the title, on purpose: they are the two
+		// ends of one rule saying two things, and a notice that shouted would be a
+		// notice that never went away quietly.
+		"input.hint":        {FG: Idx(Bright + Black), Attrs: AttrDim},
 		"input.marker":      {FG: indigo, Attrs: AttrBold},
 		"input.text":        {},
 		"input.placeholder": dim,
@@ -321,14 +335,30 @@ func DefaultTheme() *Theme {
 		"team.state":  {},
 		"team.remedy": {FG: amber},
 
-		"tasks.summary":   {FG: indigo, Attrs: AttrBold},
-		"tasks.action":    {FG: indigo},
+		// The summary line is a sentence about the run, not a headline: grey, with
+		// the panel's own colours spent on the status glyphs below it.
+		"tasks.summary":   dim,
+		"tasks.action":    dim,
 		"tasks.title":     {Attrs: AttrBold},
 		"tasks.meta":      dim,
 		"tasks.detail":    dim,
 		"tasks.pending":   {FG: slate, Attrs: AttrDim},
 		"tasks.active":    {FG: amber},
 		"tasks.completed": {FG: lime},
+
+		"extension.frame":         {FG: slate, Attrs: AttrDim},
+		"extension.frame.focused": {FG: indigo},
+		"extension.title":         {FG: slate, Attrs: AttrBold},
+		"extension.title.focused": {FG: indigo, Attrs: AttrBold},
+		"extension.text":          {},
+		"extension.muted":         dim,
+		"extension.accent":        {FG: indigo, Attrs: AttrBold},
+		"extension.success":       {FG: lime},
+		"extension.warning":       {FG: amber},
+		"extension.error":         {FG: Idx(Red)},
+		"extension.key":           {FG: indigo, Attrs: AttrBold},
+		"extension.footer":        dim,
+		"extension.stale":         {FG: amber, Attrs: AttrBold},
 
 		"effort.label": {FG: slate},
 		"effort.track": {FG: slate},
